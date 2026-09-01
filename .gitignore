@@ -35,3 +35,4 @@ coverage/
 RELEASE_CHANGELOG.md
 
 *.json
+*.jsonl
