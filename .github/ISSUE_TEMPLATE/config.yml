@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability in NoMore403
-    url: https://github.com/devploit/nomore403/security/advisories/new
+    url: https://github.com/mr-pmillz/nomore403/security/advisories/new
     about: Please report vulnerabilities in the project privately instead of opening a public issue.
   - name: Usage question
-    url: https://github.com/devploit/nomore403#readme
+    url: https://github.com/mr-pmillz/nomore403#readme
     about: Check the README first, then open a feature request if the documentation or workflow should change.

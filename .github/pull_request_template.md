@@ -12,9 +12,9 @@ Describe what this pull request changes and why.
 
 ## Testing
 
-- [ ] `gofmt -w .`
-- [ ] `go test ./...`
-- [ ] `go build ./...`
+- [ ] `make lint`
+- [ ] `make test`
+- [ ] `make build`
 - [ ] Manual testing, if relevant:
 
 ## Security and Responsible Use

@@ -1,10 +1,9 @@
-package cmd
+package cli
 
 import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -371,23 +370,6 @@ func TestJoinURL(t *testing.T) {
 		if got := joinURL(tc.base, tc.path); got != tc.want {
 			t.Fatalf("joinURL(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
 		}
-	}
-}
-
-func TestParseFileTrimsAndSkipsEmpty(t *testing.T) {
-	dir := t.TempDir()
-	filePath := filepath.Join(dir, "payloads.txt")
-	if err := os.WriteFile(filePath, []byte("foo\r\n\nbar\r\n"), 0o600); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	got, err := parseFile(filePath)
-	if err != nil {
-		t.Fatalf("parseFile error: %v", err)
-	}
-
-	if len(got) != 2 || got[0] != "foo" || got[1] != "bar" {
-		t.Fatalf("unexpected parseFile result: %#v", got)
 	}
 }
 

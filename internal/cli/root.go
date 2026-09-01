@@ -1,4 +1,4 @@
-package cmd
+package cli
 
 import (
 	"bufio"
@@ -12,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	nomore403 "github.com/mr-pmillz/nomore403"
 )
 
 var (
@@ -60,9 +62,6 @@ var rootCmd = &cobra.Command{
 
 	Run: func(cmd *cobra.Command, args []string) {
 		techniqueExplicit = cmd.Flags().Changed("technique")
-		if len(folder) == 0 {
-			folder = "payloads"
-		}
 
 		// Initialize output writer if -o flag is set
 		if outputFile != "" {
@@ -113,12 +112,6 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-// SetVersionInfo sets the version information for the root command.
-func SetVersionInfo(version, buildDate string) {
-	rootCmd.Version = version
-	rootCmd.SetVersionTemplate(fmt.Sprintf("nomore403 version %s (built %s)\n", version, buildDate))
-}
-
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
@@ -128,9 +121,13 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 
+	version, commit, date := nomore403.BuildInfo()
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate(fmt.Sprintf("nomore403 version %s (commit %s, built %s)\n", version, commit, date))
+
 	rootCmd.PersistentFlags().StringVarP(&bypassIP, "bypass-ip", "i", "", "Use a specified IP address or hostname for bypassing access controls. Injects this IP in headers like 'X-Forwarded-For'.")
 	rootCmd.PersistentFlags().IntVarP(&delay, "delay", "d", 0, "Specify a delay between requests in milliseconds. Helps manage request rate (default: 0ms).")
-	rootCmd.PersistentFlags().StringVarP(&folder, "folder", "f", "", "Specify the folder location for payloads if not in the same directory as the executable.")
+	rootCmd.PersistentFlags().StringVarP(&folder, "folder", "f", "", "Override the built-in payload lists with files from this directory. Lists missing from the directory fall back to the embedded copies.")
 	rootCmd.PersistentFlags().StringSliceVarP(&reqHeaders, "header", "H", []string{""}, "Add one or more custom headers to requests. Repeatable flag for multiple headers.")
 	rootCmd.PersistentFlags().BoolVarP(&schema, "http", "", false, "Use HTTP instead of HTTPS for requests defined in the request file.")
 	rootCmd.PersistentFlags().StringVarP(&httpMethod, "http-method", "t", "", "Specify the HTTP method for the request (e.g., GET, POST). Default is 'GET'.")

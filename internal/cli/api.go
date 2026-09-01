@@ -1,4 +1,4 @@
-package cmd
+package cli
 
 import (
 	"bufio"
@@ -48,7 +48,11 @@ func getClient(proxy *url.URL, timeout int, redirect bool) *http.Client {
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(proxy),
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
+			// nomore403 audits arbitrary hosts, many of which serve self-signed,
+			// expired or hostname-mismatched certificates. Verifying them would
+			// abort the scan on targets it is specifically meant to test, and
+			// certificate trust is not part of what this tool measures.
+			InsecureSkipVerify: true, //nolint:gosec // G402: scanning arbitrary targets by design
 		},
 		DialContext: (&net.Dialer{
 			Timeout:   timeoutDuration,
@@ -75,34 +79,6 @@ func getClient(proxy *url.URL, timeout int, redirect bool) *http.Client {
 
 	clientCache.Store(key, client)
 	return client
-}
-
-// parseFile reads a file given its filename and returns a list containing each of its lines.
-func parseFile(filename string) ([]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer func(file *os.File) {
-		if err := file.Close(); err != nil {
-			log.Printf("Error closing file: %v", err)
-		}
-	}(file)
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
-		if line == "" {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return lines, nil
 }
 
 // header represents an HTTP header.
@@ -176,11 +152,6 @@ func isTransientError(err error) bool {
 		}
 	}
 	return false
-}
-
-// request makes a single HTTP request using headers `headers` and proxy `proxy`.
-func request(method, uri string, headers []header, proxy *url.URL, timeout int, redirect bool) (ResponseInfo, error) {
-	return requestBody(method, uri, headers, "", proxy, timeout, redirect)
 }
 
 func requestBody(method, uri string, headers []header, body string, proxy *url.URL, timeout int, redirect bool) (ResponseInfo, error) {
@@ -373,10 +344,7 @@ func runAutocalibrate(options RequestOptions) (int, int) {
 	parsedURI, parseErr := url.Parse(options.uri)
 	if parseErr == nil && parsedURI.Path != "" && parsedURI.Path != "/" {
 		// Build parent path: /api/admin → /api/
-		parentPath := parsedURI.Path
-		if strings.HasSuffix(parentPath, "/") {
-			parentPath = parentPath[:len(parentPath)-1]
-		}
+		parentPath := strings.TrimSuffix(parsedURI.Path, "/")
 		lastSlash := strings.LastIndex(parentPath, "/")
 		if lastSlash >= 0 {
 			parentPath = parentPath[:lastSlash+1]
@@ -501,7 +469,9 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 	var conn net.Conn
 	if parsedURL.Scheme == "https" {
 		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-			InsecureSkipVerify: true,
+			// Same rationale as newHTTPClient: raw-HTTP techniques must reach
+			// targets whose certificates would not validate.
+			InsecureSkipVerify: true, //nolint:gosec // G402: scanning arbitrary targets by design
 			ServerName:         parsedURL.Hostname(),
 		})
 	} else {

@@ -27,6 +27,25 @@ Include as much of the following as you can:
 
 Please do not include secrets, real third-party target data, customer data, or unrelated vulnerability details.
 
+## Release Integrity
+
+Release artifacts are built by GitHub Actions from a tagged commit
+(`.github/workflows/release.yml`) using GoReleaser, and published with:
+
+- `checksums.txt` for the archives and `digests.txt` for the container images
+- [build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+  for both, verifiable with `gh attestation verify`
+- container images signed into `ghcr.io/mr-pmillz/nomore403`
+
+Verify a downloaded archive before use:
+
+```bash
+gh attestation verify nomore403_<version>_<os>_<arch>.tar.gz --repo mr-pmillz/nomore403
+```
+
+Report anything that looks like a tampered or unexpected artifact through the
+private channels above.
+
 ## Scope
 
 In scope:

@@ -1,4 +1,4 @@
-package cmd
+package cli
 
 import (
 	"fmt"
@@ -1080,14 +1080,14 @@ func TestMethodOverrideQuerySendsRequests(t *testing.T) {
 	}
 
 	// Check that _method query parameter is present
-	found_method := false
+	foundMethod := false
 	for _, uri := range capturedURIs {
 		if strings.Contains(uri, "_method=") {
-			found_method = true
+			foundMethod = true
 			break
 		}
 	}
-	if !found_method {
+	if !foundMethod {
 		t.Error("expected _method query parameter in at least one request")
 	}
 }

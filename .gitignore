@@ -27,3 +27,9 @@ nomore403.exe
 
 # MacOS
 .DS_Store
+
+# Build / release artifacts
+bin/
+dist/
+coverage/
+RELEASE_CHANGELOG.md

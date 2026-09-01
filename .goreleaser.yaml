@@ -1,35 +1,106 @@
+project_name: nomore403
+version: 2
+
+release:
+  github:
+    owner: mr-pmillz
+    name: nomore403
+  include_meta: true
+
+env:
+  - GO111MODULE=on
+  - GITHUB_TOKEN={{ .Env.GITHUB_TOKEN }}
+
 before:
   hooks:
-    - go mod download
-    - go generate ./...
+    - go mod tidy
+
 builds:
-  - env:
-      - CGO_ENABLED=0
+  - env: [CGO_ENABLED=0]
+    id: nomore403
+    main: ./cmd/nomore403
+    binary: nomore403
+    flags:
+      - -trimpath
+    asmflags:
+      - all=-trimpath={{.Env.GOPATH}}
+    gcflags:
+      - all=-trimpath={{.Env.GOPATH}}
+    ldflags: |
+      -s -w -X github.com/mr-pmillz/nomore403.version={{.Version}} -X github.com/mr-pmillz/nomore403.commit={{.Commit}} -X github.com/mr-pmillz/nomore403.date={{ .CommitDate }}
     goos:
       - linux
-      - windows
       - darwin
-    ldflags:
-      - -s -w -X main.Version={{.Version}} -X main.BuildDate={{.CommitDate}}
-    ignore:
-      - goos: darwin
-        goarch: i386
-      - goos: windows
-        goarch: arm64
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # ensures mod timestamp to be the commit timestamp
+    mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
-  - format: binary
-    name_template: "{{ .Binary }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}"
+  - id: tgz
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
 
+# Configures the checksum file generation
+# https://goreleaser.com/customization/checksum/
 checksum:
-  name_template: "checksums.txt"
+  name_template: 'checksums.txt'
 
-snapshot:
-  name_template: "{{ .Tag }}-next"
+# Change the digests filename for attestation
+# https://goreleaser.com/customization/attestations/?h=docker_digest
+docker_digest:
+  name_template: "digests.txt"
+
+# Creates a source code archive (tar.gz and zip)
+# https://goreleaser.com/customization/source/
+source:
+  enabled: true
 
 changelog:
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "Performance"
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+
+# Creates Docker images and pushes them to registries using Docker v2 API
+# https://goreleaser.com/customization/docker/
+dockers_v2:
+  - images:
+      - "ghcr.io/mr-pmillz/{{ .ProjectName }}"
+    tags:
+      - "v{{ .Version }}"
+      - "latest"
+    dockerfile: Dockerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    annotations:
+      "org.opencontainers.image.description": "Command line tool that automates different techniques to bypass 40X HTTP response codes."
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.name": "{{.ProjectName}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+      "org.opencontainers.image.source": "{{.GitURL}}"
+    labels:
+      "org.opencontainers.image.description": "Command line tool that automates different techniques to bypass 40X HTTP response codes."
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.name": "{{.ProjectName}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+      "org.opencontainers.image.source": "{{.GitURL}}"

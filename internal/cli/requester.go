@@ -1,7 +1,6 @@
-package cmd
+package cli
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +21,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/zenthangplus/goccm"
 	"golang.org/x/term"
+
+	nomore403 "github.com/mr-pmillz/nomore403"
 )
 
 type Result struct {
@@ -98,7 +99,7 @@ type RequestOptions struct {
 var atomicVerbose int32
 var atomicDefaultCl int64
 var atomicCalibTolerance int64
-var atomicDefaultSc int32     // default request status code
+var atomicDefaultSc int64     // default request status code
 var atomicDefaultRespCl int64 // default request content-length (separate from calibration)
 var atomicFragmentCl int64    // fragment baseline content-length (URI#fragment response)
 
@@ -121,8 +122,8 @@ func getCalibTolerance() int { return int(atomic.LoadInt64(&atomicCalibTolerance
 func setCalibTolerance(v int) {
 	atomic.StoreInt64(&atomicCalibTolerance, int64(v))
 }
-func getDefaultSc() int      { return int(atomic.LoadInt32(&atomicDefaultSc)) }
-func setDefaultSc(v int)     { atomic.StoreInt32(&atomicDefaultSc, int32(v)) }
+func getDefaultSc() int      { return int(atomic.LoadInt64(&atomicDefaultSc)) }
+func setDefaultSc(v int)     { atomic.StoreInt64(&atomicDefaultSc, int64(v)) }
 func getDefaultRespCl() int  { return int(atomic.LoadInt64(&atomicDefaultRespCl)) }
 func setDefaultRespCl(v int) { atomic.StoreInt64(&atomicDefaultRespCl, int64(v)) }
 func getFragmentCl() int     { return int(atomic.LoadInt64(&atomicFragmentCl)) }
@@ -320,10 +321,7 @@ func hasAnomalousRedirect(result Result, baseline ResponseInfo) bool {
 		return true
 	}
 	if baseline.statusCode < 300 || baseline.statusCode >= 400 {
-		if result.contentLength == 0 {
-			return false
-		}
-		return true
+		return result.contentLength != 0
 	}
 	location := strings.ToLower(result.location)
 	return strings.HasPrefix(location, "/") || strings.HasPrefix(location, "http://") || strings.HasPrefix(location, "https://")
@@ -331,14 +329,6 @@ func hasAnomalousRedirect(result Result, baseline ResponseInfo) bool {
 
 func isSameStatusEmptyBody(result Result, baseline ResponseInfo) bool {
 	return baseline.statusCode != 0 && baseline.statusCode == result.statusCode && result.contentLength == 0
-}
-
-func statusTransition(result Result) string {
-	base := baselineForTechnique(result.technique).statusCode
-	if base == 0 {
-		return strconv.Itoa(result.statusCode)
-	}
-	return fmt.Sprintf("%d->%d", base, result.statusCode)
 }
 
 func colorizeStatusCode(status int) string {
@@ -417,13 +407,49 @@ func scoreReason(result Result) string {
 	return strings.Join(reasons, ", ")
 }
 
+// scoreResult rates how likely a result is to be a real bypass, on 0-100.
+// The scoring runs in stages and the order matters: the redirect cap below is
+// applied to the running total, before same-status and suppression signals.
 func scoreResult(result Result) int {
 	baseline := baselineForTechnique(result.technique)
-	score := 0
-	basePriority := statusPriority(baseline.statusCode)
-	resultPriority := statusPriority(result.statusCode)
+	tolerance := getCalibTolerance()
+	if tolerance == 0 {
+		tolerance = calibrationTolerance
+	}
+	diff := absoluteDifference(result.contentLength, baseline.contentLength)
 	accessControlRedirect := looksLikeAccessControlRedirect(result.location)
 	anomalousRedirect := hasAnomalousRedirect(result, baseline)
+
+	score := scoreStatusChange(result, baseline)
+	score += scoreResponseDivergence(result, baseline, diff, tolerance)
+
+	if anomalousRedirect {
+		score += 10
+	}
+	if result.statusCode >= 300 && result.statusCode < 400 && result.contentLength == 0 {
+		score -= 12
+	}
+	if accessControlRedirect {
+		score -= 22
+	}
+	// A redirect that just looks like ordinary access control never ranks as a
+	// likely bypass, however much else diverged from the baseline.
+	if result.statusCode >= 300 && result.statusCode < 400 && (!anomalousRedirect || accessControlRedirect) && score > 24 {
+		score = 24
+	}
+
+	if baseline.statusCode == result.statusCode {
+		score += scoreSameStatusDivergence(result, baseline, diff, tolerance)
+	}
+	score += scoreSuppressionPenalties(result, baseline, diff, tolerance)
+
+	return clampScore(score)
+}
+
+// scoreStatusChange rates the response status on its own, then rates how it
+// moved relative to the technique's baseline status.
+func scoreStatusChange(result Result, baseline ResponseInfo) int {
+	score := 0
 
 	switch {
 	case result.statusCode >= 200 && result.statusCode < 300:
@@ -438,21 +464,27 @@ func scoreResult(result Result) int {
 		score -= 3
 	}
 
-	if baseline.statusCode != 0 && result.statusCode != baseline.statusCode {
-		if resultPriority > basePriority {
-			score += 30
-		} else if resultPriority == basePriority {
-			score += 8
-		} else {
-			score -= 4
-		}
+	if baseline.statusCode == 0 || result.statusCode == baseline.statusCode {
+		return score
 	}
 
-	tolerance := getCalibTolerance()
-	if tolerance == 0 {
-		tolerance = calibrationTolerance
+	switch basePriority, resultPriority := statusPriority(baseline.statusCode), statusPriority(result.statusCode); {
+	case resultPriority > basePriority:
+		score += 30
+	case resultPriority == basePriority:
+		score += 8
+	default:
+		score -= 4
 	}
-	diff := absoluteDifference(result.contentLength, baseline.contentLength)
+
+	return score
+}
+
+// scoreResponseDivergence rates how far the response body and its identifying
+// headers moved away from the baseline.
+func scoreResponseDivergence(result Result, baseline ResponseInfo, diff, tolerance int) int {
+	score := 0
+
 	switch {
 	case diff > tolerance*4:
 		score += 22
@@ -474,59 +506,67 @@ func scoreResult(result Result) int {
 	if baseline.server != "" && baseline.server != result.server {
 		score += 4
 	}
-	if anomalousRedirect {
-		score += 10
+
+	return score
+}
+
+// scoreSameStatusDivergence rewards responses that kept the baseline status but
+// changed underneath it — often the shape of a bypass that a status code alone
+// does not reveal. Only called when the statuses match.
+func scoreSameStatusDivergence(result Result, baseline ResponseInfo, diff, tolerance int) int {
+	score := 0
+
+	if hasBodyChanged(baseline, result) && result.contentLength > 0 {
+		score += 14
 	}
-	if result.statusCode >= 300 && result.statusCode < 400 && result.contentLength == 0 {
-		score -= 12
-	}
-	if accessControlRedirect {
-		score -= 22
-	}
-	if result.statusCode >= 300 && result.statusCode < 400 && (!anomalousRedirect || accessControlRedirect) {
-		if score > 24 {
-			score = 24
-		}
-	}
-	if baseline.statusCode == result.statusCode {
-		if hasBodyChanged(baseline, result) && result.contentLength > 0 {
-			score += 14
-		}
-		if !isSameStatusEmptyBody(result, baseline) {
-			switch {
-			case diff > tolerance*4:
-				score += 10
-			case diff > tolerance*2:
-				score += 6
-			case diff > tolerance:
-				score += 3
-			}
-		}
-		if baseline.contentType != "" && baseline.contentType != result.contentType {
+	if !isSameStatusEmptyBody(result, baseline) {
+		switch {
+		case diff > tolerance*4:
+			score += 10
+		case diff > tolerance*2:
 			score += 6
-		}
-		if baseline.location != "" && baseline.location != result.location {
-			score += 8
-		}
-		if baseline.server != "" && baseline.server != result.server {
+		case diff > tolerance:
 			score += 3
 		}
 	}
+	if baseline.contentType != "" && baseline.contentType != result.contentType {
+		score += 6
+	}
+	if baseline.location != "" && baseline.location != result.location {
+		score += 8
+	}
+	if baseline.server != "" && baseline.server != result.server {
+		score += 3
+	}
+
+	return score
+}
+
+// scoreSuppressionPenalties knocks down results that match the calibration
+// noise floor or are otherwise indistinguishable from the baseline.
+func scoreSuppressionPenalties(result Result, baseline ResponseInfo, diff, tolerance int) int {
+	score := 0
+
 	if isSameStatusEmptyBody(result, baseline) {
 		score -= 18
 	}
-
 	if isCalibrationMatch(result.contentLength) && result.statusCode == baseline.statusCode {
 		score -= 20
 	}
 	if (result.statusCode == 400 || result.statusCode == 404) && diff <= tolerance && result.bodyHash == baseline.bodyHash {
 		score -= 10
 	}
+
+	return score
+}
+
+// clampScore confines a raw score to the reported 0-100 range.
+func clampScore(score int) int {
 	if score < 0 {
-		score = 0
+		return 0
 	}
 	if score > 100 {
-		score = 100
+		return 100
 	}
 	return score
 }
@@ -758,36 +798,6 @@ var (
 	techniqueHeadersMutex    = &sync.Mutex{}
 )
 
-var techniqueTitles = map[string]string{
-	"default":                "DEFAULT REQUEST",
-	"verb-tampering":         "VERB TAMPERING",
-	"verb-tampering-case":    "VERB TAMPERING CASE SWITCHING",
-	"headers":                "HEADERS",
-	"endpaths":               "CUSTOM PATHS",
-	"midpaths":               "MID-PATH MUTATIONS",
-	"double-encoding":        "DOUBLE-ENCODING",
-	"unicode-encoding":       "UNICODE ENCODING",
-	"payload-position":       "PAYLOAD POSITIONS",
-	"http-versions":          "HTTP VERSIONS",
-	"http-parser":            "HTTP PARSER",
-	"path-case-switching":    "PATH CASE SWITCHING",
-	"hop-by-hop":             "HOP-BY-HOP",
-	"absolute-uri":           "ABSOLUTE URI",
-	"method-override-query":  "METHOD QUERY OVERRIDE",
-	"method-override-header": "METHOD HEADER OVERRIDE",
-	"method-override-body":   "METHOD BODY OVERRIDE",
-	"path-normalization":     "PATH NORMALIZATION",
-	"suffix-tricks":          "SUFFIX TRICKS",
-	"header-confusion":       "HEADER CONFUSION",
-	"host-override":          "HOST OVERRIDE",
-	"forwarded-trust":        "FORWARDED TRUST",
-	"proto-confusion":        "PROTO CONFUSION",
-	"ip-encoding":            "IP ENCODING",
-	"raw-duplicates":         "RAW DUPLICATES",
-	"raw-authority":          "RAW AUTHORITY",
-	"raw-desync":             "RAW DESYNC",
-}
-
 var techniqueLabels = map[string]string{
 	"default":                "Default request",
 	"verb-tampering":         "Verb tampering",
@@ -970,20 +980,6 @@ func printResponse(result Result, technique string) {
 	writeResultToOutput(result, technique)
 	markTechniqueProduced(technique)
 	recordFinding(result)
-}
-
-func ensureTechniqueHeaderLocked(technique string) {
-	if printedTechniqueHeaders[technique] {
-		return
-	}
-	title, ok := techniqueTitles[technique]
-	if !ok {
-		return
-	}
-	clearActiveProgress()
-	fmt.Println(color.CyanString("\n" + formatSectionHeader(title)))
-	redrawActiveProgress()
-	printedTechniqueHeaders[technique] = true
 }
 
 func formatSectionHeader(title string) string {
@@ -1297,7 +1293,10 @@ func executeReplay(spec ReplaySpec) (ResponseInfo, error) {
 	case "curl":
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(spec.timeout)*time.Millisecond)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "curl", spec.curlArgs...)
+		// Replays the exact curl command nomore403 printed for this finding.
+		// The arguments are built by this tool from the operator's own target
+		// and headers, and "curl" is a fixed argv[0] — there is no shell.
+		cmd := exec.CommandContext(ctx, "curl", spec.curlArgs...) //nolint:gosec // G204: replaying the operator's own reproduction command
 		out, err := cmd.Output()
 		if err != nil {
 			return ResponseInfo{}, err
@@ -1344,40 +1343,11 @@ func terminalWidth() int {
 	return 100
 }
 
-// printSuppressedSummary prints a summary of suppressed results for a technique.
-// Should be called after a technique finishes.
-func printSuppressedSummary(technique string) {
-	return
-}
-
-// colorizeContentLength returns the content-length string colored based on
-// how much it differs from the default response:
-//   - Much larger (>2x) = green (likely real content / bypass)
-//   - Larger = cyan
-//   - Similar = dim/blue (default)
-//   - Smaller = yellow
-//   - Much smaller (<50%) = red
-func colorizeContentLength(cl int) string {
-	clStr := strconv.Itoa(cl) + " bytes"
-	defCl := getDefaultRespCl()
-
-	if defCl == 0 || cl == 0 {
-		return color.BlueString(clStr)
-	}
-
-	ratio := float64(cl) / float64(defCl)
-	switch {
-	case ratio > 2.0:
-		return color.GreenString(clStr)
-	case ratio > 1.2:
-		return color.CyanString(clStr)
-	case ratio < 0.5:
-		return color.RedString(clStr)
-	case ratio < 0.8:
-		return color.YellowString(clStr)
-	default:
-		return color.BlueString(clStr)
-	}
+// printSuppressedSummary is called after a technique finishes. Suppressed
+// results are currently rolled into the end-of-run summary rather than printed
+// per technique, so this is deliberately inert; the call sites are kept so the
+// per-technique summary can be reinstated without re-threading them.
+func printSuppressedSummary(_ string) {
 }
 
 func colorizeStatusCodeLabel(status int, label string) string {
@@ -1454,10 +1424,6 @@ func ensureResultsSectionLocked(defaultReq bool) {
 	printedFindingsHeader = true
 }
 
-func formatResultsRow(techCol, statusCol, sizeCol, item string) string {
-	return fmt.Sprintf("  %s %s %s %s  %s", techCol, scoreColPlaceholder(), statusCol, sizeCol, item)
-}
-
 func formatPrintedResult(result Result) string {
 	const (
 		techWidth  = 10
@@ -1489,10 +1455,6 @@ func formatPrintedResult(result Result) string {
 	return fmt.Sprintf("  %s %s %s %s    %s", techCol, scoreCol, statusLabel, clStr, item)
 }
 
-func scoreColPlaceholder() string {
-	return fmt.Sprintf("%-4s", "")
-}
-
 func formatCompactScore(score int, likelihood string) string {
 	marker := "."
 	style := color.New(color.FgHiBlack)
@@ -1508,106 +1470,79 @@ func formatCompactScore(score int, likelihood string) string {
 }
 
 // showInfo prints the configuration options used for the scan in a compact two-column layout.
+// showInfo prints the pre-run banner, unless --no-banner was passed.
 func showInfo(options RequestOptions) {
 	if nobanner {
 		return
 	}
 
 	if options.verbose {
-		dim := color.New(color.Faint).SprintFunc()
-		val := color.New(color.FgWhite, color.Bold).SprintFunc()
-		printRow := func(label, value string) {
-			prefix := fmt.Sprintf("  %-13s ", label+":")
-			width := terminalWidth() - len(prefix)
-			if width < 20 {
-				width = 20
-			}
-			lines := wrapText(value, width)
-			for i, line := range lines {
-				if i == 0 {
-					fmt.Printf("%s%s\n", dim(prefix), val(line))
-					continue
-				}
-				fmt.Printf("%s%s\n", strings.Repeat(" ", len(prefix)), val(line))
-			}
-		}
-
-		fmt.Println(color.MagentaString("━━━━━━━━━━━━━━━━━━━━━━ NOMORE403 ━━━━━━━━━━━━━━━━━━━━━━━"))
-		printRow("Target", options.uri)
-		printRow("Method", options.method)
-		printRow("Timeout", fmt.Sprintf("%dms", options.timeout))
-		printRow("Delay", fmt.Sprintf("%dms", delay))
-		printRow("User-Agent", options.userAgent)
-
-		proxyStr := "-"
-		if len(options.proxy.Host) != 0 {
-			proxyStr = options.proxy.Host
-		}
-		ipStr := "-"
-		if len(options.bypassIP) != 0 {
-			ipStr = options.bypassIP
-		}
-		printRow("Proxy", proxyStr)
-		printRow("Bypass IP", ipStr)
-
-		var flags []string
-		if options.redirect {
-			flags = append(flags, "redirects")
-		}
-		if options.rateLimit {
-			flags = append(flags, "rate-limit")
-		}
-		if !options.autocalibrate {
-			flags = append(flags, "no-calibrate")
-		}
-		if options.strictCalibrate {
-			flags = append(flags, "strict-calibrate")
-		}
-		if options.rawHTTP {
-			flags = append(flags, "raw-http")
-		}
-		if uniqueOutput {
-			flags = append(flags, "unique")
-		}
-		if options.verbose {
-			flags = append(flags, "verbose")
-		}
-		flagStr := "-"
-		if len(flags) > 0 {
-			flagStr = strings.Join(flags, ", ")
-		}
-		printRow("Flags", flagStr)
-
-		if len(options.frontendHints) > 0 {
-			printRow("Frontend", strings.Join(options.frontendHints, ", "))
-		}
-
-		if len(options.reqHeaders) > 0 && options.reqHeaders[0] != "" {
-			hdrs := make([]string, 0)
-			for _, h := range options.headers {
-				if h.key != "User-Agent" {
-					hdrs = append(hdrs, h.key+": "+h.value)
-				}
-			}
-			if len(hdrs) > 0 {
-				printRow("Headers", strings.Join(hdrs, " | "))
-			}
-		}
-
-		if len(statusCodes) > 0 {
-			printRow("Status", strings.Join(statusCodes, ", "))
-		}
-		printRow("Techniques", strings.Join(options.techniques, ", "))
-		printRow("Payloads", options.folder)
+		showVerboseBanner(options)
 		return
 	}
+	showCompactBanner(options)
+}
 
+// showVerboseBanner prints the full, one-setting-per-row run header.
+func showVerboseBanner(options RequestOptions) {
+	dim := color.New(color.Faint).SprintFunc()
+	val := color.New(color.FgWhite, color.Bold).SprintFunc()
+	printRow := func(label, value string) {
+		prefix := fmt.Sprintf("  %-13s ", label+":")
+		width := terminalWidth() - len(prefix)
+		if width < 20 {
+			width = 20
+		}
+		for i, line := range wrapText(value, width) {
+			if i == 0 {
+				fmt.Printf("%s%s\n", dim(prefix), val(line))
+				continue
+			}
+			fmt.Printf("%s%s\n", strings.Repeat(" ", len(prefix)), val(line))
+		}
+	}
+
+	fmt.Println(color.MagentaString("━━━━━━━━━━━━━━━━━━━━━━ NOMORE403 ━━━━━━━━━━━━━━━━━━━━━━━"))
+	printRow("Target", options.uri)
+	printRow("Method", options.method)
+	printRow("Timeout", fmt.Sprintf("%dms", options.timeout))
+	printRow("Delay", fmt.Sprintf("%dms", delay))
+	printRow("User-Agent", options.userAgent)
+
+	proxyStr := "-"
+	if len(options.proxy.Host) != 0 {
+		proxyStr = options.proxy.Host
+	}
+	ipStr := "-"
+	if len(options.bypassIP) != 0 {
+		ipStr = options.bypassIP
+	}
+	printRow("Proxy", proxyStr)
+	printRow("Bypass IP", ipStr)
+	printRow("Flags", enabledFlagSummary(options))
+
+	if len(options.frontendHints) > 0 {
+		printRow("Frontend", strings.Join(options.frontendHints, ", "))
+	}
+	if hdrs := customHeaderSummary(options); hdrs != "" {
+		printRow("Headers", hdrs)
+	}
+	if len(statusCodes) > 0 {
+		printRow("Status", strings.Join(statusCodes, ", "))
+	}
+	printRow("Techniques", strings.Join(options.techniques, ", "))
+	printRow("Payloads", payloadSourceLabel(options.folder))
+}
+
+// showCompactBanner prints the default single-line run header.
+func showCompactBanner(options RequestOptions) {
 	targetWidth := terminalWidth() - 48
 	if targetWidth < 36 {
 		targetWidth = 36
 	}
 	labelStyle := color.New(color.FgHiBlack, color.Bold).SprintFunc()
 	valueStyle := color.New(color.FgWhite, color.Bold).SprintFunc()
+
 	meta := []string{
 		labelStyle("target:") + " " + valueStyle(truncateForDisplay(options.uri, targetWidth)),
 		labelStyle("method:") + " " + valueStyle(options.method),
@@ -1615,8 +1550,67 @@ func showInfo(options RequestOptions) {
 	if len(options.frontendHints) > 0 {
 		meta = append(meta, labelStyle("frontend:")+" "+valueStyle(strings.Join(options.frontendHints, ", ")))
 	}
-	meta = append(meta, labelStyle("payloads:")+" "+valueStyle(options.folder))
+	meta = append(meta, labelStyle("payloads:")+" "+valueStyle(payloadSourceLabel(options.folder)))
+
 	fmt.Println(strings.Join(meta, "   "))
+}
+
+// enabledFlagSummary lists the run-affecting toggles that are on, or "-".
+func enabledFlagSummary(options RequestOptions) string {
+	var flags []string
+	if options.redirect {
+		flags = append(flags, "redirects")
+	}
+	if options.rateLimit {
+		flags = append(flags, "rate-limit")
+	}
+	if !options.autocalibrate {
+		flags = append(flags, "no-calibrate")
+	}
+	if options.strictCalibrate {
+		flags = append(flags, "strict-calibrate")
+	}
+	if options.rawHTTP {
+		flags = append(flags, "raw-http")
+	}
+	if uniqueOutput {
+		flags = append(flags, "unique")
+	}
+	if options.verbose {
+		flags = append(flags, "verbose")
+	}
+
+	if len(flags) == 0 {
+		return "-"
+	}
+	return strings.Join(flags, ", ")
+}
+
+// customHeaderSummary renders the operator-supplied headers, excluding the
+// User-Agent that is reported on its own row. Returns "" when there are none.
+func customHeaderSummary(options RequestOptions) string {
+	if len(options.reqHeaders) == 0 || options.reqHeaders[0] == "" {
+		return ""
+	}
+
+	hdrs := make([]string, 0, len(options.headers))
+	for _, h := range options.headers {
+		if h.key == "User-Agent" {
+			continue
+		}
+		hdrs = append(hdrs, h.key+": "+h.value)
+	}
+
+	return strings.Join(hdrs, " | ")
+}
+
+// payloadSourceLabel describes where wordlists are being read from, for the
+// run banner. An empty folder means the lists compiled into the binary.
+func payloadSourceLabel(folder string) string {
+	if folder == "" {
+		return "embedded"
+	}
+	return folder + " (embedded fallback)"
 }
 
 // generateCaseCombinations generates all combinations of uppercase and lowercase letters for a given string.
@@ -1706,7 +1700,7 @@ func requestDefault(options RequestOptions) {
 
 // requestMethods makes HTTP requests using a list of methods from a file and prints the results.
 func requestMethods(options RequestOptions) {
-	lines, err := parseFile(options.folder + "/httpmethods")
+	lines, err := nomore403.PayloadLines(options.folder, "httpmethods")
 	if err != nil {
 		log.Printf("[!] Skipping verb tampering: %v", err)
 		return
@@ -1756,7 +1750,7 @@ func requestMethods(options RequestOptions) {
 
 // requestMethodsCaseSwitching makes HTTP requests using a list of methods from a file and prints the results.
 func requestMethodsCaseSwitching(options RequestOptions) {
-	lines, err := parseFile(options.folder + "/httpmethods")
+	lines, err := nomore403.PayloadLines(options.folder, "httpmethods")
 	if err != nil {
 		log.Printf("[!] Skipping verb case switching: %v", err)
 		return
@@ -1821,7 +1815,7 @@ func requestMethodsCaseSwitching(options RequestOptions) {
 // requestHeaders makes HTTP requests using a list of headers from a file and prints the results.
 func requestHeaders(options RequestOptions) {
 	// Load headers from file
-	lines, err := parseFile(options.folder + "/headers")
+	lines, err := nomore403.PayloadLines(options.folder, "headers")
 	if err != nil {
 		log.Printf("[!] Skipping headers technique: %v", err)
 		return
@@ -1832,7 +1826,7 @@ func requestHeaders(options RequestOptions) {
 	if len(options.bypassIP) != 0 {
 		ips = []string{options.bypassIP}
 	} else {
-		ips, err = parseFile(options.folder + "/ips")
+		ips, err = nomore403.PayloadLines(options.folder, "ips")
 		if err != nil {
 			log.Printf("[!] Skipping headers technique (no IPs file): %v", err)
 			return
@@ -1840,7 +1834,7 @@ func requestHeaders(options RequestOptions) {
 	}
 
 	// Load simple headers for additional testing
-	simpleHeaders, err := parseFile(options.folder + "/simpleheaders")
+	simpleHeaders, err := nomore403.PayloadLines(options.folder, "simpleheaders")
 	if err != nil {
 		log.Printf("[!] Simple headers unavailable, continuing without them: %v", err)
 		simpleHeaders = nil
@@ -2016,7 +2010,7 @@ func removeDuplicates(input []string) []string {
 
 // requestEndPaths makes HTTP requests using a list of custom end paths from a file and prints the results.
 func requestEndPaths(options RequestOptions) {
-	lines, err := parseFile(options.folder + "/endpaths")
+	lines, err := nomore403.PayloadLines(options.folder, "endpaths")
 	if err != nil {
 		log.Printf("[!] Skipping endpaths technique: %v", err)
 		return
@@ -2062,7 +2056,7 @@ func requestEndPaths(options RequestOptions) {
 
 // requestMidPaths makes HTTP requests using a list of custom mid-paths from a file and prints the results.
 func requestMidPaths(options RequestOptions) {
-	lines, err := parseFile(options.folder + "/midpaths")
+	lines, err := nomore403.PayloadLines(options.folder, "midpaths")
 	if err != nil {
 		log.Printf("[!] Skipping midpaths technique: %v", err)
 		return
@@ -2314,7 +2308,7 @@ func requestUnicodeEncoding(options RequestOptions) {
 		// byte1 = 0xC0 | (char >> 6), byte2 = 0x80 | (char & 0x3F)
 		// e.g., '/' (0x2F) → %c0%af, 'a' (0x61) → %c1%a1
 		if c < 128 {
-			byte1 := byte(0xC0) | byte(c>>6)
+			byte1 := byte(0xC0) | byte((c>>6)&0x03)
 			byte2 := byte(0x80) | byte(c&0x3F)
 			overlongEncoded := fmt.Sprintf("%%%02x%%%02x", byte1, byte2)
 			modified = basePath + lastSegment[:i] + overlongEncoded + lastSegment[i+len(string(c)):]
@@ -2367,11 +2361,11 @@ func requestPayloadPositions(options RequestOptions) {
 
 	// Load payloads from endpaths and midpaths files
 	var payloads []string
-	endPaths, err := parseFile(options.folder + "/endpaths")
+	endPaths, err := nomore403.PayloadLines(options.folder, "endpaths")
 	if err == nil {
 		payloads = append(payloads, endPaths...)
 	}
-	midPaths, err := parseFile(options.folder + "/midpaths")
+	midPaths, err := nomore403.PayloadLines(options.folder, "midpaths")
 	if err == nil {
 		payloads = append(payloads, midPaths...)
 	}
@@ -2451,8 +2445,8 @@ func isCurlAvailable() bool {
 	return curlExists
 }
 
-// requestHttpVersions makes HTTP requests using a list of HTTP versions from a file and prints the results.
-func requestHttpVersions(options RequestOptions) {
+// requestHTTPVersions makes HTTP requests using a list of HTTP versions from a file and prints the results.
+func requestHTTPVersions(options RequestOptions) {
 	if !isCurlAvailable() {
 		log.Printf("[!] Skipping HTTP versions technique: curl not found in PATH")
 		return
@@ -3172,6 +3166,58 @@ func requestSuffixTricks(options RequestOptions) {
 	p.finish()
 }
 
+// headerPayload is a named set of extra request headers exercised by the
+// header-oriented bypass techniques.
+type headerPayload struct {
+	headers []header
+	label   string
+}
+
+// runHeaderPayloads sends one request per payload, appending the payload's
+// headers to the ones already configured, and reports every response that does
+// not match the calibration baseline. The header-confusion, host-override,
+// forwarded-trust and proto-confusion techniques all drive this same loop and
+// differ only in their payload lists.
+func runHeaderPayloads(options RequestOptions, technique string, payloads []headerPayload) {
+	if len(payloads) == 0 {
+		return
+	}
+
+	w := goccm.New(maxGoroutines)
+	p := newProgress(technique, len(payloads))
+
+	for _, payload := range payloads {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		w.Wait()
+		go func(payload headerPayload) {
+			defer w.Done()
+			defer p.done()
+
+			headers := make([]header, len(options.headers))
+			copy(headers, options.headers)
+			headers = append(headers, payload.headers...)
+
+			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			if err != nil {
+				if errors.Is(err, ErrRateLimited) {
+					return
+				}
+				logVerbose(err)
+				return
+			}
+			if isCalibrationMatch(resp.contentLength) {
+				return
+			}
+
+			result := resultFromResponse(payload.label, false, technique, resp)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			printResponse(result, technique)
+		}(payload)
+	}
+	w.WaitAllDone()
+	p.finish()
+}
+
 func requestHeaderConfusion(options RequestOptions) {
 	parsedURL, err := url.Parse(options.uri)
 	if err != nil {
@@ -3188,10 +3234,7 @@ func requestHeaderConfusion(options RequestOptions) {
 		pathOnly = "/"
 	}
 
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"X-Original-URL", pathOnly}}, "X-Original-URL -> path"},
 		{[]header{{"X-Rewrite-URL", pathOnly}}, "X-Rewrite-URL -> path"},
 		{[]header{{"X-Forwarded-Uri", pathOnly}}, "X-Forwarded-Uri -> path"},
@@ -3202,42 +3245,7 @@ func requestHeaderConfusion(options RequestOptions) {
 		{[]header{{"X-Original-Host", "localhost"}, {"X-Forwarded-Host", parsedURL.Host}}, "original/forwarded host"},
 	}
 
-	w := goccm.New(maxGoroutines)
-	p := newProgress("header-confusion", len(payloads))
-
-	for _, payload := range payloads {
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
-			defer w.Done()
-			defer p.done()
-
-			headers := make([]header, len(options.headers))
-			copy(headers, options.headers)
-			headers = append(headers, payload.headers...)
-
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
-			if err != nil {
-				if errors.Is(err, ErrRateLimited) {
-					return
-				}
-				logVerbose(err)
-				return
-			}
-			if isCalibrationMatch(resp.contentLength) {
-				return
-			}
-
-			result := resultFromResponse(payload.label, false, "header-confusion", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
-			printResponse(result, "header-confusion")
-		}(payload)
-	}
-	w.WaitAllDone()
-	p.finish()
+	runHeaderPayloads(options, "header-confusion", payloads)
 }
 
 func requestHostOverride(options RequestOptions) {
@@ -3253,10 +3261,7 @@ func requestHostOverride(options RequestOptions) {
 		return
 	}
 
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"X-Forwarded-Host", "localhost"}}, "X-Forwarded-Host localhost"},
 		{[]header{{"X-Forwarded-Host", hostname + "."}}, "X-Forwarded-Host trailing dot"},
 		{[]header{{"X-Forwarded-Server", "localhost"}}, "X-Forwarded-Server localhost"},
@@ -3267,42 +3272,7 @@ func requestHostOverride(options RequestOptions) {
 		{[]header{{"Host", strings.ToUpper(hostname)}}, "Host uppercase"},
 	}
 
-	w := goccm.New(maxGoroutines)
-	p := newProgress("host-override", len(payloads))
-
-	for _, payload := range payloads {
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
-			defer w.Done()
-			defer p.done()
-
-			headers := make([]header, len(options.headers))
-			copy(headers, options.headers)
-			headers = append(headers, payload.headers...)
-
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
-			if err != nil {
-				if errors.Is(err, ErrRateLimited) {
-					return
-				}
-				logVerbose(err)
-				return
-			}
-			if isCalibrationMatch(resp.contentLength) {
-				return
-			}
-
-			result := resultFromResponse(payload.label, false, "host-override", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
-			printResponse(result, "host-override")
-		}(payload)
-	}
-	w.WaitAllDone()
-	p.finish()
+	runHeaderPayloads(options, "host-override", payloads)
 }
 
 func requestForwardedTrust(options RequestOptions) {
@@ -3311,10 +3281,7 @@ func requestForwardedTrust(options RequestOptions) {
 		bypass = "127.0.0.1"
 	}
 
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"Forwarded", "for=127.0.0.1;proto=https;host=localhost"}}, "Forwarded localhost"},
 		{[]header{{"Forwarded", "for=\"[::1]\";proto=https"}}, "Forwarded IPv6 loopback"},
 		{[]header{{"Forwarded", "for=127.0.0.1, for=198.51.100.1"}}, "Forwarded chain localhost first"},
@@ -3324,49 +3291,11 @@ func requestForwardedTrust(options RequestOptions) {
 		{[]header{{"X-Original-Remote-Addr", bypass}, {"X-Remote-IP", bypass}}, "original/remote addr"},
 	}
 
-	w := goccm.New(maxGoroutines)
-	p := newProgress("forwarded-trust", len(payloads))
-
-	for _, payload := range payloads {
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
-			defer w.Done()
-			defer p.done()
-
-			headers := make([]header, len(options.headers))
-			copy(headers, options.headers)
-			headers = append(headers, payload.headers...)
-
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
-			if err != nil {
-				if errors.Is(err, ErrRateLimited) {
-					return
-				}
-				logVerbose(err)
-				return
-			}
-			if isCalibrationMatch(resp.contentLength) {
-				return
-			}
-
-			result := resultFromResponse(payload.label, false, "forwarded-trust", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
-			printResponse(result, "forwarded-trust")
-		}(payload)
-	}
-	w.WaitAllDone()
-	p.finish()
+	runHeaderPayloads(options, "forwarded-trust", payloads)
 }
 
 func requestProtoConfusion(options RequestOptions) {
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"X-Forwarded-Proto", "https"}, {"X-Forwarded-Port", "443"}}, "https 443"},
 		{[]header{{"X-Forwarded-Proto", "http"}, {"X-Forwarded-Port", "80"}}, "http 80"},
 		{[]header{{"X-Forwarded-Proto", "https"}, {"X-Forwarded-Ssl", "on"}}, "forwarded ssl on"},
@@ -3375,42 +3304,7 @@ func requestProtoConfusion(options RequestOptions) {
 		{[]header{{"X-Forwarded-Proto", "https"}, {"X-Forwarded-Host", "localhost"}, {"X-Forwarded-Port", "443"}}, "https host localhost"},
 	}
 
-	w := goccm.New(maxGoroutines)
-	p := newProgress("proto-confusion", len(payloads))
-
-	for _, payload := range payloads {
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
-			defer w.Done()
-			defer p.done()
-
-			headers := make([]header, len(options.headers))
-			copy(headers, options.headers)
-			headers = append(headers, payload.headers...)
-
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
-			if err != nil {
-				if errors.Is(err, ErrRateLimited) {
-					return
-				}
-				logVerbose(err)
-				return
-			}
-			if isCalibrationMatch(resp.contentLength) {
-				return
-			}
-
-			result := resultFromResponse(payload.label, false, "proto-confusion", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
-			printResponse(result, "proto-confusion")
-		}(payload)
-	}
-	w.WaitAllDone()
-	p.finish()
+	runHeaderPayloads(options, "proto-confusion", payloads)
 }
 
 func requestIPEncodingHeaders(options RequestOptions) {
@@ -3502,10 +3396,7 @@ func requestRawDuplicates(options RequestOptions) {
 		bypass = "127.0.0.1"
 	}
 
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"X-Forwarded-For", bypass}, {"X-Forwarded-For", "1.1.1.1"}}, "duplicate x-forwarded-for"},
 		{[]header{{"X-Original-URL", "/"}, {"X-Original-URL", parsedURL.Path}}, "duplicate x-original-url"},
 		{[]header{{"X-Rewrite-URL", "/"}, {"X-Rewrite-URL", parsedURL.Path}}, "duplicate x-rewrite-url"},
@@ -3522,10 +3413,7 @@ func requestRawDuplicates(options RequestOptions) {
 	for _, payload := range payloads {
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
+		go func(payload headerPayload) {
 			defer w.Done()
 			defer p.done()
 
@@ -3567,10 +3455,7 @@ func requestRawAuthority(options RequestOptions) {
 		requestTarget = "/"
 	}
 
-	payloads := []struct {
-		headers []header
-		label   string
-	}{
+	payloads := []headerPayload{
 		{[]header{{"Host", parsedURL.Host}, {"Host", "localhost"}}, "duplicate host localhost"},
 		{[]header{{"Host", "localhost"}, {"Host", parsedURL.Host}}, "duplicate host original last"},
 		{[]header{{"Forwarded", "host=localhost;proto=https"}, {"Forwarded", "host=" + parsedURL.Host + ";proto=https"}}, "duplicate forwarded host"},
@@ -3585,10 +3470,7 @@ func requestRawAuthority(options RequestOptions) {
 	for _, payload := range payloads {
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 		w.Wait()
-		go func(payload struct {
-			headers []header
-			label   string
-		}) {
+		go func(payload headerPayload) {
 			defer w.Done()
 			defer p.done()
 
@@ -3749,40 +3631,6 @@ func requestRawDesync(options RequestOptions) {
 	p.finish()
 }
 
-// randomLine take a random line from a file
-func randomLine(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
-		if line == "" {
-			continue
-		}
-		lines = append(lines, line)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-
-	if len(lines) == 0 {
-		return "", fmt.Errorf("no entries found in %s", filePath)
-	}
-
-	// Select a random Line
-	randomLine := lines[rand.Intn(len(lines))]
-
-	return randomLine, nil
-}
-
 // joinURL safely joins a base URL and a path, preserving slashes
 func joinURL(base string, path string) string {
 	if !strings.HasSuffix(base, "/") && !strings.HasPrefix(path, "/") {
@@ -3838,7 +3686,7 @@ func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypa
 			userAgent = "nomore403"
 		}
 	} else {
-		line, err := randomLine(folder + "/useragents")
+		line, err := nomore403.RandomPayloadLine(folder, "useragents")
 		if err != nil {
 			log.Printf("Error reading user agents file: %v", err)
 			userAgent = "nomore403"
@@ -4026,7 +3874,7 @@ func executeTechniques(options RequestOptions) {
 			requestDoubleEncoding(options)
 			printSuppressedSummary("double-encoding")
 		case "http-versions":
-			requestHttpVersions(options)
+			requestHTTPVersions(options)
 		case "http-parser":
 			requestHTTPParser(options)
 		case "path-case":

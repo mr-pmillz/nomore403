@@ -5,10 +5,11 @@
 <h1 align="center">NoMore403</h1>
 
 <p align="center">
-  <a href="https://github.com/devploit/nomore403/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/devploit/nomore403?style=flat&logo=github"></a>
-  <a href="https://github.com/devploit/nomore403/forks"><img alt="GitHub forks" src="https://img.shields.io/github/forks/devploit/nomore403?style=flat&logo=github"></a>
-  <a href="https://goreportcard.com/report/github.com/devploit/nomore403"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/devploit/nomore403"></a>
-  <img alt="Go version" src="https://img.shields.io/badge/go-1.24-blue">
+  <a href="https://github.com/mr-pmillz/nomore403/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mr-pmillz/nomore403?style=flat&logo=github"></a>
+  <a href="https://github.com/mr-pmillz/nomore403/forks"><img alt="GitHub forks" src="https://img.shields.io/github/forks/mr-pmillz/nomore403?style=flat&logo=github"></a>
+  <a href="https://goreportcard.com/report/github.com/mr-pmillz/nomore403"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/mr-pmillz/nomore403"></a>
+  <a href="https://github.com/mr-pmillz/nomore403/pkgs/container/nomore403"><img alt="GHCR image" src="https://img.shields.io/badge/ghcr.io-mr--pmillz%2Fnomore403-blue?logo=docker"></a>
+  <img alt="Go version" src="https://img.shields.io/badge/go-1.26-blue">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Contributions welcome" src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg">
 </p>
@@ -43,31 +44,69 @@ This tool does not "break authentication" by itself. It helps find differences b
 
 ## Installation
 
-### Build from source
+Every payload wordlist is compiled into the binary, so `nomore403` runs stand-alone
+from any working directory — there is no `payloads/` folder to ship alongside it.
+
+### Download a release
+
+Prebuilt archives for linux, darwin and windows (amd64 and arm64) are attached to
+each [release](https://github.com/mr-pmillz/nomore403/releases), together with
+`checksums.txt` and build provenance attestations.
+
+### Container image
+
+Images are published to the GitHub Container Registry on every release:
 
 ```bash
-git clone https://github.com/devploit/nomore403
-cd nomore403
-go build
+docker pull ghcr.io/mr-pmillz/nomore403:latest
+docker run --rm ghcr.io/mr-pmillz/nomore403:latest -u https://target.tld/admin
 ```
+
+The image is multi-arch (`linux/amd64`, `linux/arm64`), runs as an unprivileged
+user (uid 10001), and needs no volume mounts. To write results to the host, mount
+a directory and point `-o` at it:
+
+```bash
+docker run --rm -v "$PWD/out:/out" ghcr.io/mr-pmillz/nomore403:latest \
+  -u https://target.tld/admin --jsonl -o /out/findings.jsonl
+```
+
+To override a payload list, mount your own directory and pass `-f`:
+
+```bash
+docker run --rm -v "$PWD/payloads:/payloads:ro" ghcr.io/mr-pmillz/nomore403:latest \
+  -u https://target.tld/admin -f /payloads
+```
+
+Image tags: `latest` and `vX.Y.Z`.
 
 ### Install with Go
 
 ```bash
-go install github.com/devploit/nomore403@latest
+go install github.com/mr-pmillz/nomore403/cmd/nomore403@latest
 ```
 
-If you install with `go install`, the `payloads/` directory is not installed automatically. Clone the repository and point the tool to that directory with `-f` if needed.
+### Build from source
+
+```bash
+git clone https://github.com/mr-pmillz/nomore403
+cd nomore403
+make build      # -> bin/nomore403
+```
+
+`make help` lists the other targets (`test`, `test-race`, `test-coverage`, `lint`,
+`docker`, `snapshot`, `install`).
 
 ## Requirements
 
-- Go 1.24 or later to build from source
+- Go 1.26.6 or later to build from source
 - `curl` available in `PATH` for techniques that depend on it, such as:
   - `http-versions`
   - `http-parser`
   - `absolute-uri`
 
-Most techniques work without `curl`.
+Most techniques work without `curl`. The container image ships `curl`, so all
+techniques work there out of the box.
 
 ## Quick Start
 
@@ -110,7 +149,7 @@ Write machine-readable output:
 ## Example Output
 
 ```text
-target: https://target.tld/admin   method: GET   frontend: AWS ELB/ALB   payloads: payloads
+target: https://target.tld/admin   method: GET   frontend: AWS ELB/ALB   payloads: embedded
 
 calib: 404 | 1245b | ±50 | frag 703b
 
@@ -456,9 +495,11 @@ Use `--jsonl` when you want to:
 
 ## Payload Files
 
-The `payloads/` directory contains lists used by several techniques.
+The wordlists in `payloads/` are embedded into the binary at build time
+(`//go:embed`), so a released binary or container image carries them with it and
+works from any directory with no extra files.
 
-Current files include:
+The lists are:
 
 - `httpmethods`
 - `headers`
@@ -468,7 +509,20 @@ Current files include:
 - `midpaths`
 - `useragents`
 
-You can customize these files to fit your targets or workflow.
+### Overriding a list
+
+`-f/--folder` points at a directory of replacement lists:
+
+```bash
+nomore403 -u https://target.tld/admin -f ./my-payloads
+```
+
+The override is per file. Any list the directory does not contain falls back to
+the embedded copy, so you can override just `headers` without having to supply
+the other six. The run banner shows which source is in use (`payloads: embedded`
+or `payloads: ./my-payloads (embedded fallback)`).
+
+Edits to `payloads/` in a source checkout take effect on the next build.
 
 ## Limitations
 
