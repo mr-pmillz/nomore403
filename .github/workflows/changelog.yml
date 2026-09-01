@@ -57,8 +57,8 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # ratchet:actions/create-github-app-token@v3
         id: app-token
         with:
-          client-id: ${{ secrets.NOMORE403_APP_ID }}
-          private-key: ${{ secrets.NOMORE403_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.SJ_APP_ID }}
+          private-key: ${{ secrets.SJ_APP_PRIVATE_KEY }}
 
       - name: Generate CHANGELOG.md
         uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # ratchet:orhun/git-cliff-action@v4
