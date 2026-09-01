@@ -1693,7 +1693,10 @@ func selectRandomCombinations(combinations []string, n int) []string {
 		return combinations
 	}
 
-	rand.Shuffle(len(combinations), func(i, j int) {
+	// Sampling which case variations to send, purely to cap request volume.
+	// Nothing here is unpredictable-by-necessity, so the standard PRNG is the
+	// right tool; crypto/rand would buy nothing but syscalls.
+	rand.Shuffle(len(combinations), func(i, j int) { //nolint:gosec // G404: request sampling, not a security decision
 		combinations[i], combinations[j] = combinations[j], combinations[i]
 	})
 
@@ -3507,7 +3510,9 @@ func urlOverrideCandidates(options RequestOptions, bases []urlOverrideBase) []ur
 // nonexistentPath builds a path that no application should serve, used as the
 // control probe for header-driven routing.
 func nonexistentPath() string {
-	return fmt.Sprintf("/nomore403-%08x", rand.Uint32()) //nolint:gosec // control probe, not a security decision
+	// A prefixed 32-bit token is far more than enough for a path no application
+	// should serve; it never has to resist prediction by the target.
+	return fmt.Sprintf("/nomore403-%08x", rand.Uint32()) //nolint:gosec // G404: control probe, not a security decision
 }
 
 func requestHostOverride(options RequestOptions) {
