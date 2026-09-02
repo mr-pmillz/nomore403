@@ -71,7 +71,8 @@ func RandomPayloadLine(dir, name string) (string, error) {
 		return "", fmt.Errorf("no entries found in payload list %q", name)
 	}
 
-	return lines[rand.Intn(len(lines))], nil //nolint:gosec // wordlist selection, not a security decision
+	// Picking a User-Agent to blend in with; unpredictability is not required.
+	return lines[rand.Intn(len(lines))], nil //nolint:gosec // G404: wordlist selection, not a security decision
 }
 
 // payloadBytes resolves a wordlist to its raw bytes, preferring an operator

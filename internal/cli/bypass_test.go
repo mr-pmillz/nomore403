@@ -86,6 +86,8 @@ func resetTestState() {
 	jsonResultsMutex.Lock()
 	jsonResults = nil
 	jsonResultsMutex.Unlock()
+	// Tests must not depend on whether the test runner has a TTY.
+	setProgressMode(progressOff)
 	resetMaps()
 }
 
@@ -1737,5 +1739,216 @@ func TestCrossTechniqueDedupCollapsesSimilarFamilies(t *testing.T) {
 
 	if suppressedCrossTechniqueFamilies["header-confusion"] == 0 {
 		t.Fatalf("expected similar cross-technique result to be collapsed")
+	}
+}
+
+// findingsForTechnique returns the findings recorded for one technique.
+func findingsForTechnique(technique string) []Result {
+	topFindingsMutex.Lock()
+	defer topFindingsMutex.Unlock()
+
+	var out []Result
+	for _, f := range topFindings {
+		if f.technique == technique {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// findingLines summarises findings for assertion failure messages.
+func findingLines(findings []Result) []string {
+	lines := make([]string, 0, len(findings))
+	for _, f := range findings {
+		lines = append(lines, fmt.Sprintf("%s (%d, %db)", f.line, f.statusCode, f.contentLength))
+	}
+	return lines
+}
+
+// urlOverrideLab stands up a server shaped like a front-end that enforces access
+// control on the request line while the back-end routes on X-Original-URL.
+func urlOverrideLab(t *testing.T, honourOverride bool) *httptest.Server {
+	t.Helper()
+
+	const homepage = "<html><body><h1>Blog</h1><p>" +
+		"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod " +
+		"tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim." +
+		"</p></body></html>"
+	const adminPanel = "<html><body><h1>Admin panel</h1><a href='/admin/delete'>Delete</a></body></html>"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Front-end: denies /admin on the request line, and only there.
+		if strings.HasPrefix(r.URL.Path, "/admin") {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("Access denied"))
+			return
+		}
+
+		routed := r.URL.Path
+		if honourOverride {
+			if override := r.Header.Get("X-Original-URL"); override != "" {
+				routed = override
+			}
+		}
+
+		switch routed {
+		case "/":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(homepage))
+		case "/admin":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(adminPanel))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("Not Found"))
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	return ts
+}
+
+func TestURLOverrideFindsRequestLineAccessControlBypass(t *testing.T) {
+	// Arrange
+	resetTestState()
+	setVerbose(false)
+	ts := urlOverrideLab(t, true)
+
+	opts := RequestOptions{
+		uri:        ts.URL + "/admin",
+		method:     "GET",
+		headers:    []header{{"User-Agent", "nomore403"}},
+		timeout:    5000,
+		folder:     "",
+		techniques: []string{"url-override"},
+	}
+
+	// Act
+	requestURLOverride(opts)
+
+	// Assert
+	findings := findingsForTechnique("url-override")
+	if len(findings) == 0 {
+		t.Fatal("url-override reported nothing; expected the X-Original-URL bypass to be found")
+	}
+
+	var found *Result
+	for i := range findings {
+		if strings.Contains(findings[i].line, "X-Original-URL") {
+			found = &findings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no X-Original-URL finding; got %v", findingLines(findings))
+	}
+	if found.statusCode != http.StatusOK {
+		t.Errorf("expected the bypass to report 200, got %d", found.statusCode)
+	}
+	if !strings.Contains(found.line, "/admin") {
+		t.Errorf("finding should name the blocked path, got %q", found.line)
+	}
+	if found.score < 55 {
+		t.Errorf("a request-line access-control bypass should score high, got %d", found.score)
+	}
+	if !strings.Contains(found.reproCurl, "X-Original-URL: /admin") {
+		t.Errorf("repro curl should carry the override header, got %q", found.reproCurl)
+	}
+}
+
+func TestURLOverrideReportsNothingWhenBackendIgnoresTheHeader(t *testing.T) {
+	// Arrange: same front-end block, but the back-end never reads the header, so
+	// every probe collapses onto the plain "/" response.
+	resetTestState()
+	setVerbose(false)
+	ts := urlOverrideLab(t, false)
+
+	opts := RequestOptions{
+		uri:        ts.URL + "/admin",
+		method:     "GET",
+		headers:    []header{{"User-Agent", "nomore403"}},
+		timeout:    5000,
+		techniques: []string{"url-override"},
+	}
+
+	// Act
+	requestURLOverride(opts)
+
+	// Assert
+	if findings := findingsForTechnique("url-override"); len(findings) != 0 {
+		t.Fatalf("expected no findings when the header is ignored, got %v", findingLines(findings))
+	}
+}
+
+func TestURLOverrideSkipsRootTargets(t *testing.T) {
+	// Arrange: there is no blocked path to smuggle when the target is the root.
+	resetTestState()
+	setVerbose(false)
+	ts := urlOverrideLab(t, true)
+
+	opts := RequestOptions{
+		uri:        ts.URL + "/",
+		method:     "GET",
+		headers:    []header{{"User-Agent", "nomore403"}},
+		timeout:    5000,
+		techniques: []string{"url-override"},
+	}
+
+	// Act
+	requestURLOverride(opts)
+
+	// Assert
+	if findings := findingsForTechnique("url-override"); len(findings) != 0 {
+		t.Fatalf("expected no findings for a root target, got %v", findingLines(findings))
+	}
+}
+
+func TestURLOverrideTargetValueKeepsQueryString(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://x.tld/admin", "/admin"},
+		{"https://x.tld/admin?a=1&b=2", "/admin?a=1&b=2"},
+		{"https://x.tld/api/v1/admin", "/api/v1/admin"},
+		{"https://x.tld/", ""},
+		{"https://x.tld", ""},
+	}
+
+	for _, tc := range cases {
+		parsed, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		if got := urlOverrideTargetValue(parsed); got != tc.want {
+			t.Errorf("urlOverrideTargetValue(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestURLOverrideBasePathsWalkUpToRoot(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{"https://x.tld/admin", []string{"/"}},
+		{"https://x.tld/admin/", []string{"/"}},
+		{"https://x.tld/api/v1/admin", []string{"/", "/api/v1/"}},
+	}
+
+	for _, tc := range cases {
+		parsed, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		got := urlOverrideBasePaths(parsed)
+		if len(got) != len(tc.want) {
+			t.Fatalf("urlOverrideBasePaths(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("urlOverrideBasePaths(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		}
 	}
 }

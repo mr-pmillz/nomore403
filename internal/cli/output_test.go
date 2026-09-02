@@ -156,3 +156,103 @@ func TestOutputWriter_JSONL(t *testing.T) {
 		t.Fatalf("unexpected first jsonl result: %+v", first)
 	}
 }
+
+func TestJSONLStreamsRecordsAsTheyArrive(t *testing.T) {
+	// Arrange
+	resetTestState()
+	jsonOutput = false
+	jsonLines = true
+	defer func() { jsonLines = false }()
+
+	path := filepath.Join(t.TempDir(), "findings.jsonl")
+	if err := initOutputWriter(path); err != nil {
+		t.Fatalf("initOutputWriter: %v", err)
+	}
+	defer closeOutputWriter()
+
+	// Act: write one record, then read the file back before the run ends.
+	writeResultToOutput(Result{line: "GET /admin", statusCode: 200, contentLength: 1234, score: 90, likelihood: "high"}, "verb-tampering")
+
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled temp path
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	// Assert: the record is already on disk, not waiting for closeOutputWriter.
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 streamed line before close, got %d: %q", len(lines), string(data))
+	}
+	var record JSONResult
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("streamed line is not valid JSON: %v (%q)", err, lines[0])
+	}
+	if record.Technique != "verb-tampering" || record.StatusCode != 200 {
+		t.Errorf("unexpected streamed record: %+v", record)
+	}
+}
+
+func TestJSONLRecordCarriesTheRequestThatProducedIt(t *testing.T) {
+	// Arrange
+	resetTestState()
+	jsonOutput = false
+	jsonLines = true
+	defer func() { jsonLines = false }()
+
+	path := filepath.Join(t.TempDir(), "findings.jsonl")
+	if err := initOutputWriter(path); err != nil {
+		t.Fatalf("initOutputWriter: %v", err)
+	}
+
+	// A url-override finding: the request goes to "/", not to the target /admin.
+	result := Result{line: "X-Original-URL: /admin via /", statusCode: 200, contentLength: 3218, score: 100, likelihood: "high"}
+	attachHTTPReplay(&result, "GET", "https://target.tld/", []header{{"X-Original-URL", "/admin"}}, "", false, nil, 5000)
+
+	// Act
+	writeResultToOutput(result, "url-override")
+	closeOutputWriter()
+
+	// Assert
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled temp path
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	var record JSONResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &record); err != nil {
+		t.Fatalf("invalid JSONL: %v (%q)", err, string(data))
+	}
+
+	if record.Method != "GET" {
+		t.Errorf("record.Method = %q, want GET", record.Method)
+	}
+	if record.URL != "https://target.tld/" {
+		t.Errorf("record.URL = %q, want the URL actually requested (https://target.tld/)", record.URL)
+	}
+	if !strings.Contains(record.ReproCurl, "X-Original-URL: /admin") {
+		t.Errorf("record.ReproCurl should carry the override header, got %q", record.ReproCurl)
+	}
+}
+
+func TestJSONLBuffersWhenWritingToStdout(t *testing.T) {
+	// Arrange: with no -o there is no separate sink, so records must be held
+	// back rather than interleaved into the human-readable report on stdout.
+	resetTestState()
+	jsonOutput = false
+	jsonLines = true
+	defer func() { jsonLines = false }()
+	outputWriter = nil
+
+	// Act
+	writeResultToOutput(Result{line: "GET /admin", statusCode: 200, contentLength: 10}, "verb-tampering")
+
+	// Assert
+	jsonResultsMutex.Lock()
+	buffered := len(jsonResults)
+	jsonResultsMutex.Unlock()
+	if buffered != 1 {
+		t.Fatalf("expected the record to be buffered for the stdout flush, got %d buffered", buffered)
+	}
+	if streamingJSONLines() {
+		t.Error("streamingJSONLines() = true with no output file, want false")
+	}
+}
