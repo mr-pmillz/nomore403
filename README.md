@@ -39,7 +39,8 @@ This tool does not "break authentication" by itself. It helps find differences b
 - Retry and backoff for transient network failures
 - Concurrent execution with per-technique progress
 - Raw HTTP support for request forms that `net/http` normalizes away
-- JSON and JSONL output for pipelines and post-processing
+- JSON and JSONL output for pipelines and post-processing, with streaming JSONL
+- Progress reporting that adapts to a TTY or a log/CI environment
 - Input from a single URL, URL files, stdin, or request files
 
 ## Installation
@@ -268,7 +269,10 @@ The tool runs all techniques by default unless you specify `-k`.
 - `hop-by-hop`
   - hop-by-hop stripping tricks using `Connection`
 - `header-confusion`
-  - rewrite and path-override headers such as `X-Original-URL`
+  - rewrite and path-override headers such as `X-Original-URL`, sent to the blocked path
+- `url-override`
+  - the same rewrite headers, but sent to a path the front-end *permits*, carrying the
+    blocked path to the back-end (the classic `GET /` + `X-Original-URL: /admin` bypass)
 - `host-override`
   - host override and forwarded-host variants
 - `forwarded-trust`
@@ -474,6 +478,37 @@ Key flags:
   - minimum score for `INTERESTING VARIATIONS`
 - `--top`
   - maximum number of entries per summary section, or `0` to disable summaries
+- `--progress`
+  - progress reporting style: `auto`, `tty`, `plain`, or `none`
+
+## Progress Reporting
+
+Progress is written to **stderr**, so it never mixes into `--json`/`--jsonl`
+output on stdout and can always be discarded with `2>/dev/null`.
+
+`--progress` selects the style, and defaults to `auto`:
+
+| Value | Behavior |
+|---|---|
+| `auto` (default) | animated bar when stderr is a terminal, plain status lines otherwise |
+| `tty` | always draw the in-place animated bar |
+| `plain` | always write append-only status lines |
+| `none` | report no progress at all |
+
+`auto` means an interactive run gets the live bar, while a redirected, piped or
+CI run still reports liveness instead of going silent for minutes. Plain lines
+carry no ANSI escapes and no carriage returns, so they stay readable in a log
+file:
+
+```text
+[progress] header-confusion: 48 requests
+[progress] header-confusion: 25% (12/48)
+[progress] header-confusion: 50% (24/48)
+[progress] header-confusion: 75% (36/48)
+[progress] header-confusion: done 48/48 in 1.4s
+```
+
+Techniques with fewer than 20 requests report only their start and done lines.
 
 ## Output Formats
 
@@ -483,15 +518,44 @@ Default mode is optimized for interactive review and triage.
 
 ### JSON
 
-Use `--json` for a single structured document.
+Use `--json` for a single structured document. The array can only be written
+once the run finishes, so records are buffered until then.
 
 ### JSON Lines
 
-Use `--jsonl` when you want to:
+Use `--jsonl` for one JSON object per line, when you want to:
 
 - process results incrementally
 - store evidence in pipelines
 - import findings into your own tooling
+
+With `-o`, records are **streamed**: each finding is written and flushed as it is
+found, so the file can be tailed or consumed while the scan is still running.
+
+```bash
+nomore403 -u https://target.tld/admin --jsonl -o findings.jsonl &
+tail -f findings.jsonl | jq -r 'select(.score >= 90) | "\(.score)\t\(.technique)\t\(.repro_curl)"'
+```
+
+Without `-o` the lines go to stdout, where the human-readable report is already
+being written, so they are held back and flushed at the end of the run instead of
+interleaving with it. Prefer `-o` when piping into another tool.
+
+Each record carries the request that produced it, not just the target:
+
+| Field | Meaning |
+|---|---|
+| `technique`, `payload` | which technique fired, and the specific mutation |
+| `score`, `likelihood`, `score_reason` | ranking and why |
+| `method`, `url` | the request that produced the response |
+| `request_target` | the raw request-line target, for raw HTTP techniques |
+| `status_code`, `content_length`, `body_hash`, `content_type`, `location`, `server` | the response |
+| `repro_curl` | a copy-pasteable reproduction |
+
+`url` matters for techniques whose request is not aimed at the target path. A
+`url-override` finding, for example, reports `"url": "https://target.tld/"` with
+`"payload": "X-Original-URL: /admin via /"` — the request went to `/`, and the
+header carried `/admin`.
 
 ## Payload Files
 

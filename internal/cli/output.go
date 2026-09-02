@@ -16,6 +16,9 @@ type JSONResult struct {
 	Score         int    `json:"score"`
 	Likelihood    string `json:"likelihood"`
 	ScoreReason   string `json:"score_reason,omitempty"`
+	Method        string `json:"method,omitempty"`
+	URL           string `json:"url,omitempty"`
+	RequestTarget string `json:"request_target,omitempty"`
 	BodyHash      string `json:"body_hash,omitempty"`
 	Location      string `json:"location,omitempty"`
 	ContentType   string `json:"content_type,omitempty"`
@@ -24,10 +27,21 @@ type JSONResult struct {
 }
 
 var (
-	outputWriter     *os.File
+	outputWriter *os.File
+	// jsonResults buffers records for --json, which has to be one array
+	// document and therefore cannot be written until the run ends. --jsonl
+	// streams instead and never touches this.
 	jsonResults      []JSONResult
 	jsonResultsMutex sync.Mutex
 )
+
+// streamingJSONLines reports whether records should be written one per line as
+// they are found rather than buffered to the end of the run. Streaming needs a
+// destination of its own: with -o the file is that destination, while without
+// it the only sink is stdout, which the human-readable report is already using.
+func streamingJSONLines() bool {
+	return jsonLines && outputWriter != nil
+}
 
 // initOutputWriter opens the output file for writing.
 func initOutputWriter(path string) error {
@@ -46,42 +60,73 @@ func closeOutputWriter() {
 		return
 	}
 
-	if jsonOutput || jsonLines {
+	// --jsonl already wrote every record as it was found; only the single-document
+	// --json form still owes the file its contents.
+	if jsonOutput && !jsonLines {
 		jsonResultsMutex.Lock()
-		var data []byte
-		var err error
-		if jsonLines {
-			var lines []byte
-			for _, item := range jsonResults {
-				line, marshalErr := json.Marshal(item)
-				if marshalErr != nil {
-					err = marshalErr
-					break
-				}
-				lines = append(lines, line...)
-				lines = append(lines, '\n')
-			}
-			data = lines
-		} else {
-			data, err = json.MarshalIndent(jsonResults, "", "  ")
-			if err == nil {
-				data = append(data, '\n')
-			}
-		}
+		data, err := json.MarshalIndent(jsonResults, "", "  ")
 		jsonResultsMutex.Unlock()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] Error marshaling JSON: %v\n", err)
 		} else {
-			outputWriter.Write(data)
+			data = append(data, '\n')
+			if _, writeErr := outputWriter.Write(data); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "[!] Error writing JSON output: %v\n", writeErr)
+			}
 		}
 	}
 
-	outputWriter.Close()
+	if err := outputWriter.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Error closing output file: %v\n", err)
+	}
 	outputWriter = nil
 }
 
+// writeJSONLine marshals one record and appends it to the output file as a
+// single line. Caller MUST hold jsonResultsMutex.
+func writeJSONLineLocked(record JSONResult) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Error marshaling JSON: %v\n", err)
+		return
+	}
+	data = append(data, '\n')
+	if _, err := outputWriter.Write(data); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Error writing JSONL output: %v\n", err)
+	}
+}
+
+// jsonRecord converts a result into its serialisable form. The replay spec
+// carries the request that actually produced the response, which is not always
+// the target URL -- url-override, for one, reports findings for requests aimed
+// at a different path entirely.
+func jsonRecord(result Result, technique string) JSONResult {
+	record := JSONResult{
+		StatusCode:    result.statusCode,
+		ContentLength: result.contentLength,
+		Technique:     technique,
+		Payload:       result.line,
+		Score:         result.score,
+		Likelihood:    result.likelihood,
+		ScoreReason:   result.scoreReason,
+		BodyHash:      result.bodyHash,
+		Location:      result.location,
+		ContentType:   result.contentType,
+		Server:        result.server,
+		ReproCurl:     result.reproCurl,
+	}
+	if result.replay != nil {
+		record.Method = result.replay.method
+		record.URL = result.replay.uri
+		record.RequestTarget = result.replay.requestTarget
+	}
+	return record
+}
+
 // writeResultToOutput writes a result to the output file.
-// In JSON mode, it accumulates results (thread-safe via jsonResultsMutex).
+// With --jsonl and -o it streams one JSON object per line as results arrive;
+// with --json, or when writing to stdout, it accumulates them for the flush at
+// the end of the run (thread-safe via jsonResultsMutex).
 // In plain mode, it writes immediately — caller MUST hold printMutex.
 func writeResultToOutput(result Result, technique string) {
 	if outputWriter == nil && !jsonOutput && !jsonLines {
@@ -89,24 +134,20 @@ func writeResultToOutput(result Result, technique string) {
 	}
 
 	if jsonOutput || jsonLines {
-		jsonResultsMutex.Lock()
-		jsonResults = append(jsonResults, JSONResult{
-			StatusCode:    result.statusCode,
-			ContentLength: result.contentLength,
-			Technique:     technique,
-			Payload:       result.line,
-			Score:         result.score,
-			Likelihood:    result.likelihood,
-			ScoreReason:   result.scoreReason,
-			BodyHash:      result.bodyHash,
-			Location:      result.location,
-			ContentType:   result.contentType,
-			Server:        result.server,
-			ReproCurl:     result.reproCurl,
-		})
-		jsonResultsMutex.Unlock()
+		record := jsonRecord(result, technique)
 
-		// If no output file, write JSON to stdout at close
+		jsonResultsMutex.Lock()
+		defer jsonResultsMutex.Unlock()
+
+		if streamingJSONLines() {
+			// One record per line, flushed as it is found, so the file can be
+			// tailed or fed to a consumer while the scan is still running.
+			writeJSONLineLocked(record)
+			return
+		}
+		// Buffered: --json needs a whole array, and a stdout run has to wait
+		// until the human-readable report is done before emitting anything.
+		jsonResults = append(jsonResults, record)
 		return
 	}
 

@@ -6,6 +6,7 @@ All notable changes to this project will be documented [here](https://github.com
 
 ### ✨ New features
 
+- Add branch-policy.yml workflow check - ([fc74d68](https://github.com/mr-pmillz/nomore403/commit/fc74d6878c57a78a22d2a989c66229c0f95644e0))
 - Feat: add input list, JSON output, unicode encoding, and custom payload positions - ([7bbc033](https://github.com/mr-pmillz/nomore403/commit/7bbc03341b5731a46c60c6bcc7707e9163aba763))
 - Feat: add --version flag - ([4e607bd](https://github.com/mr-pmillz/nomore403/commit/4e607bd7a5584d833da02101daf08d738c5413b7))
 - Added raw urls support - on parsing and sending sending requests - ([ad5cdcb](https://github.com/mr-pmillz/nomore403/commit/ad5cdcbe9bf66934c1161775d430defa07869632))

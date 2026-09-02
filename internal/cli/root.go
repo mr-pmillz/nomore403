@@ -61,6 +61,10 @@ var rootCmd = &cobra.Command{
 	Long:  `Command line application that automates different ways to bypass 40X codes.`,
 
 	Run: func(cmd *cobra.Command, args []string) {
+		if err := validateProgressPreference(progressPreference); err != nil {
+			log.Printf("[!] %v", err)
+			return
+		}
 		techniqueExplicit = cmd.Flags().Changed("technique")
 
 		// Initialize output writer if -o flag is set
@@ -133,6 +137,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&httpMethod, "http-method", "t", "", "Specify the HTTP method for the request (e.g., GET, POST). Default is 'GET'.")
 	rootCmd.PersistentFlags().IntVarP(&maxGoroutines, "max-goroutines", "m", 50, "Limit the maximum number of concurrent goroutines to manage load (default: 50).")
 	rootCmd.PersistentFlags().BoolVarP(&nobanner, "no-banner", "", false, "Disable the display of the startup banner (default: banner shown).")
+	rootCmd.PersistentFlags().StringVarP(&progressPreference, "progress", "", progressPreferenceAuto, "Progress reporting style: auto (bar on a TTY, status lines otherwise), tty, plain, or none.")
 	rootCmd.PersistentFlags().StringVarP(&proxy, "proxy", "x", "", "Specify a proxy server for requests (e.g., 'http://server:port').")
 	rootCmd.PersistentFlags().BoolVarP(&randomAgent, "random-agent", "", false, "Enable the use of a randomly selected User-Agent.")
 	rootCmd.PersistentFlags().BoolVarP(&rateLimit, "rate-limit", "l", false, "Halt requests upon encountering a 429 (rate limit) HTTP status code.")
@@ -141,7 +146,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&noCalibrate, "no-calibrate", "", false, "Disable auto-calibration filtering and always compare results against the default request baseline.")
 	rootCmd.PersistentFlags().BoolVarP(&strictCalibrate, "strict-calibrate", "", false, "Use a stricter default-response comparison that also considers body hash and key response headers.")
 	rootCmd.PersistentFlags().StringSliceVarP(&statusCodes, "status", "", []string{}, "Filter output by comma-separated status codes (e.g., 200,301,403)")
-	rootCmd.PersistentFlags().StringSliceVarP(&technique, "technique", "k", []string{"verbs", "verbs-case", "headers", "endpaths", "midpaths", "double-encoding", "unicode", "http-versions", "http-parser", "path-case", "hop-by-hop", "absolute-uri", "method-override", "path-normalization", "suffix-tricks", "header-confusion", "host-override", "forwarded-trust", "proto-confusion", "ip-encoding", "raw-duplicates", "raw-authority", "raw-desync"}, "Specify one or more attack techniques to use (e.g., headers,path-case,unicode).")
+	rootCmd.PersistentFlags().StringSliceVarP(&technique, "technique", "k", []string{"verbs", "verbs-case", "headers", "endpaths", "midpaths", "double-encoding", "unicode", "http-versions", "http-parser", "path-case", "hop-by-hop", "absolute-uri", "method-override", "path-normalization", "suffix-tricks", "header-confusion", "url-override", "host-override", "forwarded-trust", "proto-confusion", "ip-encoding", "raw-duplicates", "raw-authority", "raw-desync"}, "Specify one or more attack techniques to use (e.g., headers,path-case,unicode).")
 	rootCmd.PersistentFlags().IntVarP(&timeout, "timeout", "", 6000, "Specify a max timeout time in ms.")
 	rootCmd.PersistentFlags().IntVarP(&retryCount, "retry-count", "", 2, "Number of retries for transient errors and rate limiting when retrying is allowed.")
 	rootCmd.PersistentFlags().IntVarP(&retryBackoffMs, "retry-backoff-ms", "", 500, "Base backoff in milliseconds used between retries.")
