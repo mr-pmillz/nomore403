@@ -30,6 +30,7 @@ var (
 	timeout           int
 	redirect          bool
 	reqHeaders        []string
+	headerFile        string
 	requestFile       string
 	schema            bool
 	technique         []string
@@ -67,6 +68,17 @@ var rootCmd = &cobra.Command{
 		}
 		techniqueExplicit = cmd.Flags().Changed("technique")
 
+		var privateStore *privateHeaderStore
+		if headerFile != "" {
+			var err error
+			privateStore, err = loadPrivateHeaderFile(headerFile)
+			if err != nil {
+				log.Printf("[!] %v", err)
+				return
+			}
+			defer privateStore.wipe()
+		}
+
 		// Initialize output writer if -o flag is set
 		if outputFile != "" {
 			if err := initOutputWriter(outputFile); err != nil {
@@ -99,10 +111,10 @@ var rootCmd = &cobra.Command{
 				}
 				urls = append(urls, line)
 			}
-			runTargets(urls)
+			runTargetsPrivate(urls, privateStore)
 		} else {
 			if len(requestFile) > 0 {
-				loadFlagsFromRequestFile(requestFile, schema, verbose, technique, redirect)
+				loadFlagsFromRequestFilePrivate(requestFile, schema, verbose, technique, redirect, privateStore)
 			} else {
 				if len(uri) == 0 {
 					_ = cmd.Help()
@@ -110,7 +122,7 @@ var rootCmd = &cobra.Command{
 				}
 				// Check if -u value is a file containing URLs
 				urls := readURLsFromInput(uri)
-				runTargets(urls)
+				runTargetsPrivate(urls, privateStore)
 			}
 		}
 	},
@@ -133,6 +145,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVarP(&delay, "delay", "d", 0, "Specify a delay between requests in milliseconds. Helps manage request rate (default: 0ms).")
 	rootCmd.PersistentFlags().StringVarP(&folder, "folder", "f", "", "Override the built-in payload lists with files from this directory. Lists missing from the directory fall back to the embedded copies.")
 	rootCmd.PersistentFlags().StringSliceVarP(&reqHeaders, "header", "H", []string{""}, "Add one or more custom headers to requests. Repeatable flag for multiple headers.")
+	rootCmd.PersistentFlags().StringVar(&headerFile, "header-file", "", "Read private request headers once from an owner-only file; values are origin-scoped and excluded from output and replays.")
 	rootCmd.PersistentFlags().BoolVarP(&schema, "http", "", false, "Use HTTP instead of HTTPS for requests defined in the request file.")
 	rootCmd.PersistentFlags().StringVarP(&httpMethod, "http-method", "t", "", "Specify the HTTP method for the request (e.g., GET, POST). Default is 'GET'.")
 	rootCmd.PersistentFlags().IntVarP(&maxGoroutines, "max-goroutines", "m", 50, "Limit the maximum number of concurrent goroutines to manage load (default: 50).")
@@ -165,14 +178,29 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&payloadPosition, "payload-position", "p", "", "Marker in URL indicating where to insert payloads (e.g., §). Use in URL like: -u 'http://example.com/§100§/admin'.")
 }
 
-func runTargets(urls []string) {
-	lastHostRun := make(map[string]time.Time)
-
+func runTargetsPrivate(urls []string, store *privateHeaderStore) {
+	type preparedTarget struct {
+		url     string
+		private *privateHeaders
+	}
+	prepared := make([]preparedTarget, 0, len(urls))
 	for _, target := range urls {
 		target = strings.TrimSpace(target)
 		if target == "" {
 			continue
 		}
+		private, err := store.forTarget(target)
+		if err != nil {
+			log.Printf("[!] %v", err)
+			return
+		}
+		prepared = append(prepared, preparedTarget{url: target, private: private})
+	}
+
+	lastHostRun := make(map[string]time.Time)
+
+	for _, item := range prepared {
+		target := item.url
 
 		if hostDelayMs > 0 {
 			if parsed, err := url.Parse(target); err == nil && parsed.Host != "" {
@@ -186,7 +214,7 @@ func runTargets(urls []string) {
 			}
 		}
 
-		requester(target, proxy, userAgent, reqHeaders, bypassIP, folder, httpMethod, verbose, technique, nobanner, rateLimit, timeout, redirect, randomAgent)
+		requesterPrivate(target, proxy, userAgent, reqHeaders, bypassIP, folder, httpMethod, verbose, technique, nobanner, rateLimit, timeout, redirect, randomAgent, item.private)
 	}
 }
 

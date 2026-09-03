@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -71,6 +72,7 @@ type ReplaySpec struct {
 	timeout       int
 	requestTarget string
 	curlArgs      []string
+	private       *privateHeaders
 }
 
 type RequestOptions struct {
@@ -94,6 +96,7 @@ type RequestOptions struct {
 	frontendHints    []string
 	payloadPositions []string // extracted marked segments from URL template
 	uriTemplate      string   // original URI with markers for payload injection
+	privateHeaders   *privateHeaders
 }
 
 // Thread-safe globals using atomic operations.
@@ -643,7 +646,7 @@ func responseInfoFromResult(result Result) ResponseInfo {
 	}
 }
 
-func attachHTTPReplay(result *Result, method, uri string, headers []header, body string, redirect bool, proxy *url.URL, timeout int) {
+func attachHTTPReplay(result *Result, method, uri string, headers []header, body string, redirect bool, proxy *url.URL, timeout int, private ...*privateHeaders) {
 	result.reproCurl = buildCurlCommand(method, uri, headers, body, redirect, proxy)
 	proxyValue := ""
 	if proxy != nil {
@@ -659,9 +662,12 @@ func attachHTTPReplay(result *Result, method, uri string, headers []header, body
 		proxy:    proxyValue,
 		timeout:  timeout,
 	}
+	if len(private) > 0 {
+		result.replay.private = private[0]
+	}
 }
 
-func attachRawReplay(result *Result, method, uri, requestTarget string, headers []header, body string, timeout int) {
+func attachRawReplay(result *Result, method, uri, requestTarget string, headers []header, body string, timeout int, private ...*privateHeaders) {
 	result.reproCurl = buildCurlCommand(method, uri, headers, body, false, nil)
 	result.replay = &ReplaySpec{
 		kind:          "raw",
@@ -672,14 +678,20 @@ func attachRawReplay(result *Result, method, uri, requestTarget string, headers 
 		timeout:       timeout,
 		requestTarget: requestTarget,
 	}
+	if len(private) > 0 {
+		result.replay.private = private[0]
+	}
 }
 
-func attachCurlReplay(result *Result, curlArgs []string, display string, timeout int) {
+func attachCurlReplay(result *Result, curlArgs []string, display string, timeout int, private ...*privateHeaders) {
 	result.reproCurl = display
 	result.replay = &ReplaySpec{
 		kind:     "curl",
 		curlArgs: append([]string(nil), curlArgs...),
 		timeout:  timeout,
+	}
+	if len(private) > 0 {
+		result.replay.private = private[0]
 	}
 }
 
@@ -1314,21 +1326,14 @@ func executeReplay(spec ReplaySpec) (ResponseInfo, error) {
 			}
 			proxyURL = parsed
 		}
-		return requestWithRetryBody(spec.method, spec.uri, spec.headers, spec.body, proxyURL, false, spec.timeout, spec.redirect)
+		return requestWithRetryBodyPrivate(spec.method, spec.uri, spec.headers, spec.body, proxyURL, false, spec.timeout, spec.redirect, spec.private)
 	case "raw":
-		return rawRequest(spec.method, spec.uri, spec.requestTarget, spec.headers, spec.body, spec.timeout)
+		return rawRequestPrivate(spec.method, spec.uri, spec.requestTarget, spec.headers, spec.body, spec.timeout, spec.private)
 	case "curl":
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(spec.timeout)*time.Millisecond)
-		defer cancel()
-		// Replays the exact curl command nomore403 printed for this finding.
-		// The arguments are built by this tool from the operator's own target
-		// and headers, and "curl" is a fixed argv[0] — there is no shell.
-		cmd := exec.CommandContext(ctx, "curl", spec.curlArgs...) //nolint:gosec // G204: replaying the operator's own reproduction command
-		out, err := cmd.Output()
-		if err != nil {
-			return ResponseInfo{}, err
+		res := curlRequestPrivate(spec.curlArgs, "curl-replay", spec.timeout, spec.private)
+		if res.statusCode == 0 {
+			return ResponseInfo{}, errors.New("curl replay failed")
 		}
-		res := parseCurlOutput(string(out), "curl-replay")
 		return ResponseInfo{
 			statusCode:    res.statusCode,
 			contentLength: res.contentLength,
@@ -1705,7 +1710,7 @@ func selectRandomCombinations(combinations []string, n int) []string {
 
 // requestDefault makes HTTP request to check the default response
 func requestDefault(options RequestOptions) {
-	resp, err := requestWithRetry(options.method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+	resp, err := requestWithRetryPrivate(options.method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 	if err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			log.Printf("[!] Rate limited on default request, aborting")
@@ -1722,7 +1727,7 @@ func requestDefault(options RequestOptions) {
 	}
 
 	base := resultFromResponse(options.uri, true, "default", resp)
-	attachHTTPReplay(&base, options.method, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout)
+	attachHTTPReplay(&base, options.method, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 	setGlobalBaseline(resp)
 	setTechniqueBaseline("default", resp)
 	printResponse(base, "default")
@@ -1749,7 +1754,7 @@ func requestMethods(options RequestOptions) {
 		go func(line string) {
 			defer w.Done()
 			defer p.done()
-			resp, err := requestWithRetry(line, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(line, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					log.Printf("[!] Rate limited, stopping verb tampering")
@@ -1770,7 +1775,7 @@ func requestMethods(options RequestOptions) {
 			}
 
 			result := resultFromResponse(line, false, "verb-tampering", resp)
-			attachHTTPReplay(&result, line, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, line, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "verb-tampering")
 		}(line)
 	}
@@ -1818,7 +1823,7 @@ func requestMethodsCaseSwitching(options RequestOptions) {
 		go func(item workItem) {
 			defer w.Done()
 			defer p.done()
-			resp, err := requestWithRetry(item.method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(item.method, options.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -1834,7 +1839,7 @@ func requestMethodsCaseSwitching(options RequestOptions) {
 			}
 
 			result := resultFromResponse(item.method, false, "verb-tampering-case", resp)
-			attachHTTPReplay(&result, item.method, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, item.method, options.uri, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "verb-tampering-case")
 		}(item)
 	}
@@ -1938,7 +1943,7 @@ func requestHeaders(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, header{item.Line, item.IP})
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -1948,7 +1953,7 @@ func requestHeaders(options RequestOptions) {
 			}
 
 			result := resultFromResponse(item.Line+": "+item.IP, false, "headers-ip", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "headers-ip")
 		}(item)
 	}
@@ -1974,7 +1979,7 @@ func requestHeaders(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, header{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])})
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -1984,7 +1989,7 @@ func requestHeaders(options RequestOptions) {
 			}
 
 			result := resultFromResponse(line, false, "headers-simple", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "headers-simple")
 		}(simpleHeader)
 	}
@@ -2001,7 +2006,7 @@ func requestHeaders(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, v)
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2014,7 +2019,7 @@ func requestHeaders(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse(v.key+": "+v.value, false, "headers-host", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "headers-host")
 		}(v)
 	}
@@ -2059,7 +2064,7 @@ func requestEndPaths(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, joinURL(options.uri, line), options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, joinURL(options.uri, line), options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2075,7 +2080,7 @@ func requestEndPaths(options RequestOptions) {
 			}
 
 			result := resultFromResponse(joinURL(options.uri, line), false, "endpaths", resp)
-			attachHTTPReplay(&result, options.method, joinURL(options.uri, line), options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, joinURL(options.uri, line), options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "endpaths")
 		}(line)
 	}
@@ -2141,7 +2146,7 @@ func requestMidPaths(options RequestOptions) {
 			}
 			fullpath += queryStr
 
-			resp, err := requestWithRetry(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2154,7 +2159,7 @@ func requestMidPaths(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse(fullpath, false, "midpaths", resp)
-			attachHTTPReplay(&result, options.method, fullpath, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, fullpath, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "midpaths")
 		}(line)
 	}
@@ -2256,7 +2261,7 @@ func requestDoubleEncoding(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2266,7 +2271,7 @@ func requestDoubleEncoding(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload, false, "double-encoding", resp)
-			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "double-encoding")
 		}(payload)
 	}
@@ -2360,7 +2365,7 @@ func requestUnicodeEncoding(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2373,7 +2378,7 @@ func requestUnicodeEncoding(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse(payload, false, "unicode-encoding", resp)
-			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "unicode-encoding")
 		}(payload)
 	}
@@ -2439,7 +2444,7 @@ func requestPayloadPositions(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, item.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, item.uri, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2452,7 +2457,7 @@ func requestPayloadPositions(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse(item.uri, false, "payload-position", resp)
-			attachHTTPReplay(&result, options.method, item.uri, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, item.uri, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "payload-position")
 		}(item)
 	}
@@ -2489,15 +2494,15 @@ func requestHTTPVersions(options RequestOptions) {
 	}
 
 	baselineArgs, _ := buildCurlVersionInvocation(options.method, options.uri, options.headers, proxyValue, "--http1.1", options.redirect)
-	baselineResult := curlRequest(baselineArgs, "--http1.1", options.timeout)
+	baselineResult := curlRequestPrivate(baselineArgs, "--http1.1", options.timeout, options.privateHeaders)
 	if baselineResult.statusCode != 0 {
 		setTechniqueBaseline("http-versions", responseInfoFromResult(baselineResult))
 	}
 
 	for _, version := range httpVersions {
 		args, display := buildCurlVersionInvocation(options.method, options.uri, options.headers, proxyValue, version, options.redirect)
-		res := curlRequest(args, version, options.timeout)
-		attachCurlReplay(&res, args, display, options.timeout)
+		res := curlRequestPrivate(args, version, options.timeout, options.privateHeaders)
+		attachCurlReplay(&res, args, display, options.timeout, options.privateHeaders)
 		printResponse(res, "http-versions")
 	}
 }
@@ -2514,18 +2519,18 @@ func requestHTTPParser(options RequestOptions) {
 	}
 
 	baselineArgs, _ := buildCurlVersionInvocation(options.method, options.uri, options.headers, proxyValue, "--http1.1", options.redirect)
-	baselineResult := curlRequest(baselineArgs, "--http1.1", options.timeout)
+	baselineResult := curlRequestPrivate(baselineArgs, "--http1.1", options.timeout, options.privateHeaders)
 	if baselineResult.statusCode != 0 {
 		setTechniqueBaseline("http-parser", responseInfoFromResult(baselineResult))
 	}
 
 	args, display := buildCurlParserInvocation(options.method, options.uri, proxyValue, options.redirect)
-	res := curlRequest(args, "http-parser", options.timeout)
+	res := curlRequestPrivate(args, "http-parser", options.timeout, options.privateHeaders)
 	if res.statusCode == 0 {
 		return
 	}
 	res.line = "minimal curl request"
-	attachCurlReplay(&res, args, display, options.timeout)
+	attachCurlReplay(&res, args, display, options.timeout, options.privateHeaders)
 	printResponse(res, "http-parser")
 }
 
@@ -2579,25 +2584,70 @@ func buildCurlParserInvocation(method, uri string, proxy string, followRedirects
 	return args, strings.Join(displayArgs, " ")
 }
 
-func curlRequest(args []string, httpVersion string, timeout int) Result {
+func curlRequestPrivate(args []string, httpVersion string, timeout int, private *privateHeaders) Result {
 	if len(args) == 0 {
 		return Result{}
 	}
+	actualArgs, config, err := prepareCurlInvocation(args, private)
+	if err != nil {
+		log.Printf("[!] Curl command failed: %v", err)
+		return Result{}
+	}
+	defer wipeBytes(config)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "curl", args...)
+	cmd := exec.CommandContext(ctx, "curl", actualArgs...)
+	if len(config) > 0 {
+		cmd.Stdin = bytes.NewReader(config)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("[!] Curl command failed: %v", err)
 		return Result{}
 	}
 
-	return parseCurlOutput(string(out), httpVersion)
+	result := parseCurlOutputPrivate(string(out), httpVersion, private != nil)
+	private.redactResult(&result)
+	return result
+}
+
+func prepareCurlInvocation(args []string, private *privateHeaders) ([]string, []byte, error) {
+	actualArgs := append([]string(nil), args...)
+	if private == nil {
+		return actualArgs, nil, nil
+	}
+	if err := private.validatePublic(curlArgumentHeaders(args)); err != nil {
+		return nil, nil, err
+	}
+	config, err := private.curlConfig(requestURLFromCurlArgs(args))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(config) == 0 {
+		return actualArgs, nil, nil
+	}
+
+	// curl applies custom headers to redirected hosts. With private config in
+	// use, following redirects is disabled at this seam because curl cannot
+	// enforce the per-origin policy itself.
+	filtered := make([]string, 0, len(actualArgs)+2)
+	filtered = append(filtered, "--config", "-")
+	for _, arg := range actualArgs {
+		if arg == "-L" || arg == "--location" || arg == "--location-trusted" {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return filtered, config, nil
 }
 
 func parseCurlOutput(output string, httpVersion string) Result {
+	return parseCurlOutputPrivate(output, httpVersion, false)
+}
+
+func parseCurlOutputPrivate(output string, httpVersion string, sensitive bool) Result {
 	httpVersionOutput := strings.ReplaceAll(httpVersion, "--http", "HTTP/")
 
 	serverResponse := output
@@ -2617,7 +2667,11 @@ func parseCurlOutput(output string, httpVersion string) Result {
 
 	headerBodyParts := strings.SplitN(serverResponse, "\r\n\r\n", 2)
 	if len(headerBodyParts) == 0 || headerBodyParts[0] == "" {
-		log.Printf("[!] Invalid server response format: %s", serverResponse)
+		if sensitive {
+			log.Printf("[!] Invalid server response format")
+		} else {
+			log.Printf("[!] Invalid server response format: %s", serverResponse)
+		}
 		return Result{}
 	}
 
@@ -2629,19 +2683,31 @@ func parseCurlOutput(output string, httpVersion string) Result {
 
 	lines := strings.Split(headerBlock, "\r\n")
 	if len(lines) < 1 {
-		log.Printf("[!] Invalid server response format: %s", serverResponse)
+		if sensitive {
+			log.Printf("[!] Invalid server response format")
+		} else {
+			log.Printf("[!] Invalid server response format: %s", serverResponse)
+		}
 		return Result{}
 	}
 
 	parts := strings.SplitN(lines[0], " ", 3)
 	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
-		log.Printf("[!] Invalid status line: %s", lines[0])
+		if sensitive {
+			log.Printf("[!] Invalid status line")
+		} else {
+			log.Printf("[!] Invalid status line: %s", lines[0])
+		}
 		return Result{}
 	}
 
 	statusCode, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil {
-		log.Printf("[!] Error parsing status code: %v", err)
+		if sensitive {
+			log.Printf("[!] Error parsing status code")
+		} else {
+			log.Printf("[!] Error parsing status code: %v", err)
+		}
 		return Result{}
 	}
 
@@ -2738,7 +2804,7 @@ func requestPathCaseSwitching(options RequestOptions) {
 			pathSegments[lastSegmentIndex] = segmentVariant
 			fullpath := baseuri + strings.Join(pathSegments, "/") + queryStr
 
-			resp, err := requestWithRetry(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, fullpath, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2748,7 +2814,7 @@ func requestPathCaseSwitching(options RequestOptions) {
 			}
 
 			result := resultFromResponse(fullpath, false, "path-case-switching", resp)
-			attachHTTPReplay(&result, options.method, fullpath, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, fullpath, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "path-case-switching")
 		}(segmentVariant)
 	}
@@ -2805,7 +2871,7 @@ func requestHopByHop(options RequestOptions) {
 			headers = append(headers, header{target.name, target.value})
 			headers = append(headers, header{"Connection", "close, " + target.name})
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2818,7 +2884,7 @@ func requestHopByHop(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse(target.name+": "+target.value+" + Connection: close, "+target.name, false, "hop-by-hop", resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "hop-by-hop")
 		}(target)
 	}
@@ -2866,23 +2932,14 @@ func requestAbsoluteURI(options RequestOptions) {
 		// Use the original host for the actual connection
 		args = append(args, connectURL)
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(options.timeout)*time.Millisecond)
-		cmd := exec.CommandContext(ctx, "curl", args...)
-		out, err := cmd.Output()
-		cancel()
-		if err != nil {
-			logVerbose("[!] Absolute URI curl failed:", err)
-			continue
-		}
-
 		// Show the curl command so the user can reproduce the bypass
 		label := "curl --request-target '" + requestTarget + "' " + connectURL
-		res := parseCurlOutput(string(out), label)
+		res := curlRequestPrivate(args, label, options.timeout, options.privateHeaders)
 		if res.statusCode == 0 {
 			continue
 		}
 		res.line = "request-target: " + requestTarget
-		attachCurlReplay(&res, args, label, options.timeout)
+		attachCurlReplay(&res, args, label, options.timeout, options.privateHeaders)
 		printResponse(res, "absolute-uri")
 	}
 }
@@ -2906,7 +2963,7 @@ func buildAbsoluteURIPayloads(parsedURL *url.URL, pathAndQuery string) []string 
 
 func setRawTechniqueBaseline(technique string, options RequestOptions, requestTarget string) {
 	baselineHeaders := cloneHeaders(options.headers)
-	rawBaseline, err := rawRequest(options.method, options.uri, requestTarget, baselineHeaders, "", options.timeout)
+	rawBaseline, err := rawRequestPrivate(options.method, options.uri, requestTarget, baselineHeaders, "", options.timeout, options.privateHeaders)
 	if err == nil {
 		setTechniqueBaseline(technique, rawBaseline)
 	}
@@ -2936,7 +2993,7 @@ func requestMethodOverrideQuery(options RequestOptions) {
 			targetURI := options.uri + separator + "_method=" + overrideMethod
 
 			// Send as POST (frameworks only process _method on POST)
-			resp, err := requestWithRetry("POST", targetURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate("POST", targetURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -2949,7 +3006,7 @@ func requestMethodOverrideQuery(options RequestOptions) {
 				return
 			}
 			result := resultFromResponse("POST "+targetURI, false, "method-override-query", resp)
-			attachHTTPReplay(&result, "POST", targetURI, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, "POST", targetURI, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "method-override-query")
 		}(overrideMethod)
 	}
@@ -2977,7 +3034,7 @@ func requestMethodOverrideHeaders(options RequestOptions) {
 				copy(headers, options.headers)
 				headers = append(headers, header{headerName, overrideMethod})
 
-				resp, err := requestWithRetry("POST", options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				resp, err := requestWithRetryPrivate("POST", options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 				if err != nil {
 					if errors.Is(err, ErrRateLimited) {
 						return
@@ -2990,7 +3047,7 @@ func requestMethodOverrideHeaders(options RequestOptions) {
 				}
 
 				result := resultFromResponse(headerName+": "+overrideMethod, false, "method-override-header", resp)
-				attachHTTPReplay(&result, "POST", options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+				attachHTTPReplay(&result, "POST", options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 				printResponse(result, "method-override-header")
 			}(headerName, overrideMethod)
 		}
@@ -3031,7 +3088,7 @@ func requestMethodOverrideBody(options RequestOptions) {
 				copy(headers, options.headers)
 				headers = append(headers, header{"Content-Type", tpl.contentType})
 
-				resp, err := requestWithRetryBody("POST", options.uri, headers, body, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				resp, err := requestWithRetryBodyPrivate("POST", options.uri, headers, body, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 				if err != nil {
 					if errors.Is(err, ErrRateLimited) {
 						return
@@ -3044,7 +3101,7 @@ func requestMethodOverrideBody(options RequestOptions) {
 				}
 
 				result := resultFromResponse(tpl.label+": "+overrideMethod, false, "method-override-body", resp)
-				attachHTTPReplay(&result, "POST", options.uri, headers, body, options.redirect, options.proxy, options.timeout)
+				attachHTTPReplay(&result, "POST", options.uri, headers, body, options.redirect, options.proxy, options.timeout, options.privateHeaders)
 				printResponse(result, "method-override-body")
 			}(tpl, overrideMethod)
 		}
@@ -3108,7 +3165,7 @@ func requestPathNormalization(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -3121,7 +3178,7 @@ func requestPathNormalization(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload, false, "path-normalization", resp)
-			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "path-normalization")
 		}(payload)
 	}
@@ -3175,7 +3232,7 @@ func requestSuffixTricks(options RequestOptions) {
 			defer w.Done()
 			defer p.done()
 
-			resp, err := requestWithRetry(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, payload, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -3188,7 +3245,7 @@ func requestSuffixTricks(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload, false, "suffix-tricks", resp)
-			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, payload, options.headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "suffix-tricks")
 		}(payload)
 	}
@@ -3227,7 +3284,7 @@ func runHeaderPayloads(options RequestOptions, technique string, payloads []head
 			copy(headers, options.headers)
 			headers = append(headers, payload.headers...)
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -3240,7 +3297,7 @@ func runHeaderPayloads(options RequestOptions, technique string, payloads []head
 			}
 
 			result := resultFromResponse(payload.label, false, technique, resp)
-			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, options.uri, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, technique)
 		}(payload)
 	}
@@ -3372,7 +3429,7 @@ func requestURLOverride(options RequestOptions) {
 			defer p.done()
 
 			headers := append(cloneHeaders(options.headers), header{candidate.name, targetValue})
-			resp, err := requestWithRetry(options.method, candidate.baseURI, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, candidate.baseURI, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if !errors.Is(err, ErrRateLimited) {
 					logVerbose(err)
@@ -3388,7 +3445,7 @@ func requestURLOverride(options RequestOptions) {
 
 			label := candidate.name + ": " + targetValue + " via " + candidate.basePath
 			result := resultFromResponse(label, false, "url-override", resp)
-			attachHTTPReplay(&result, options.method, candidate.baseURI, headers, "", options.redirect, options.proxy, options.timeout)
+			attachHTTPReplay(&result, options.method, candidate.baseURI, headers, "", options.redirect, options.proxy, options.timeout, options.privateHeaders)
 			printResponse(result, "url-override")
 		}(candidate)
 	}
@@ -3418,7 +3475,7 @@ func urlOverrideBases(options RequestOptions, parsedURL *url.URL) []urlOverrideB
 	var bases []urlOverrideBase
 	for _, path := range urlOverrideBasePaths(parsedURL) {
 		baseURI := parsedURL.Scheme + "://" + parsedURL.Host + path
-		resp, err := requestWithRetry(options.method, baseURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+		resp, err := requestWithRetryPrivate(options.method, baseURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 		if err != nil {
 			if !errors.Is(err, ErrRateLimited) {
 				logVerbose(err)
@@ -3469,7 +3526,7 @@ func urlOverrideCandidates(options RequestOptions, bases []urlOverrideBase) []ur
 				defer p.done()
 
 				headers := append(cloneHeaders(options.headers), header{name, nonexistentPath()})
-				control, err := requestWithRetry(options.method, base.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+				control, err := requestWithRetryPrivate(options.method, base.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 				if err != nil {
 					if !errors.Is(err, ErrRateLimited) {
 						logVerbose(err)
@@ -3621,7 +3678,7 @@ func requestIPEncodingHeaders(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, payload.headers...)
 
-			resp, err := requestWithRetry(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+			resp, err := requestWithRetryPrivate(options.method, options.uri, headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 			if err != nil {
 				if errors.Is(err, ErrRateLimited) {
 					return
@@ -3688,7 +3745,7 @@ func requestRawDuplicates(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, payload.headers...)
 
-			resp, err := rawRequest(options.method, options.uri, requestTarget, headers, "", options.timeout)
+			resp, err := rawRequestPrivate(options.method, options.uri, requestTarget, headers, "", options.timeout, options.privateHeaders)
 			if err != nil {
 				logVerbose(err)
 				return
@@ -3698,7 +3755,7 @@ func requestRawDuplicates(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload.label, false, "raw-duplicates", resp)
-			attachRawReplay(&result, options.method, options.uri, requestTarget, headers, "", options.timeout)
+			attachRawReplay(&result, options.method, options.uri, requestTarget, headers, "", options.timeout, options.privateHeaders)
 			printResponse(result, "raw-duplicates")
 		}(payload)
 	}
@@ -3745,7 +3802,7 @@ func requestRawAuthority(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, payload.headers...)
 
-			resp, err := rawRequest(options.method, options.uri, requestTarget, headers, "", options.timeout)
+			resp, err := rawRequestPrivate(options.method, options.uri, requestTarget, headers, "", options.timeout, options.privateHeaders)
 			if err != nil {
 				logVerbose(err)
 				return
@@ -3755,7 +3812,7 @@ func requestRawAuthority(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload.label, false, "raw-authority", resp)
-			attachRawReplay(&result, options.method, options.uri, requestTarget, headers, "", options.timeout)
+			attachRawReplay(&result, options.method, options.uri, requestTarget, headers, "", options.timeout, options.privateHeaders)
 			printResponse(result, "raw-authority")
 		}(payload)
 	}
@@ -3880,7 +3937,7 @@ func requestRawDesync(options RequestOptions) {
 			copy(headers, options.headers)
 			headers = append(headers, payload.headers...)
 
-			resp, err := rawRequest(payload.method, options.uri, payload.requestTarget, headers, payload.body, options.timeout)
+			resp, err := rawRequestPrivate(payload.method, options.uri, payload.requestTarget, headers, payload.body, options.timeout, options.privateHeaders)
 			if err != nil {
 				logVerbose(err)
 				return
@@ -3890,7 +3947,7 @@ func requestRawDesync(options RequestOptions) {
 			}
 
 			result := resultFromResponse(payload.label, false, "raw-desync", resp)
-			attachRawReplay(&result, payload.method, options.uri, payload.requestTarget, headers, payload.body, options.timeout)
+			attachRawReplay(&result, payload.method, options.uri, payload.requestTarget, headers, payload.body, options.timeout, options.privateHeaders)
 			printResponse(result, "raw-desync")
 		}(payload)
 	}
@@ -3929,6 +3986,10 @@ func validateURI(uri string) error {
 
 // setupRequestOptions configures and returns RequestOptions based on the provided parameters.
 func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypassIP, folder, method string, verbose bool, techniques []string, banner, rateLimit bool, timeout int, redirect, randomAgent bool) RequestOptions {
+	return setupRequestOptionsPrivate(uri, proxy, userAgent, reqHeaders, bypassIP, folder, method, verbose, techniques, banner, rateLimit, timeout, redirect, randomAgent, nil)
+}
+
+func setupRequestOptionsPrivate(uri, proxy, userAgent string, reqHeaders []string, bypassIP, folder, method string, verbose bool, techniques []string, banner, rateLimit bool, timeout int, redirect, randomAgent bool, private *privateHeaders) RequestOptions {
 	// Set up proxy if provided.
 	if len(proxy) != 0 {
 		if !strings.Contains(proxy, "http") {
@@ -4001,6 +4062,7 @@ func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypa
 		autocalibrate:   !verbose && !noCalibrate,
 		strictCalibrate: strictCalibrate,
 		rawHTTP:         rawHTTP,
+		privateHeaders:  private,
 	}
 	opts.frontendHints = inferFrontendHints(uri, ResponseInfo{})
 	if !techniqueExplicit {
@@ -4017,6 +4079,70 @@ func setupRequestOptions(uri, proxy, userAgent string, reqHeaders []string, bypa
 	}
 
 	return opts
+}
+
+// validatePrivateTechniqueCollisions checks known generated header names before
+// calibration. The transport seams repeat the check for defense in depth and
+// to protect against names introduced by future payloads.
+func validatePrivateTechniqueCollisions(options RequestOptions) error {
+	if options.privateHeaders == nil {
+		return nil
+	}
+
+	var generated []header
+	add := func(names ...string) {
+		for _, name := range names {
+			generated = append(generated, header{key: name})
+		}
+	}
+
+	for _, technique := range options.techniques {
+		switch technique {
+		case "headers":
+			add("Host")
+			if names, err := nomore403.PayloadLines(options.folder, "headers"); err == nil {
+				for _, name := range names {
+					add(strings.TrimSpace(name))
+				}
+			}
+			if lines, err := nomore403.PayloadLines(options.folder, "simpleheaders"); err == nil {
+				for _, line := range lines {
+					if name, _, ok := strings.Cut(strings.TrimSpace(line), " "); ok {
+						add(name)
+					}
+				}
+			}
+		case "http-parser":
+			add("User-Agent", "Accept", "Connection", "Host")
+		case "hop-by-hop":
+			add("X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "X-Custom-IP-Authorization",
+				"X-Original-URL", "X-Rewrite-URL", "CF-Connecting-IP", "True-Client-IP", "Connection")
+		case "method-override":
+			add("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override", "Content-Type")
+		case "header-confusion":
+			add("X-Original-URL", "X-Rewrite-URL", "X-Forwarded-Uri", "X-Forwarded-URL",
+				"X-Forwarded-Prefix", "Front-End-Https", "X-Forwarded-Proto", "X-Original-Host", "X-Forwarded-Host")
+		case "url-override":
+			add(urlOverrideHeaders...)
+		case "host-override":
+			add("X-Forwarded-Host", "X-Forwarded-Server", "X-Host", "X-HTTP-Host-Override", "X-Original-Host", "Host")
+		case "forwarded-trust":
+			add("Forwarded", "Client-IP", "Cluster-Client-IP", "X-Forwarded-For", "X-Client-IP",
+				"True-Client-IP", "X-Original-Remote-Addr", "X-Remote-IP")
+		case "proto-confusion":
+			add("X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Ssl", "Front-End-Https",
+				"X-Url-Scheme", "X-Forwarded-Protocol", "X-Original-Scheme", "X-Forwarded-Host")
+		case "ip-encoding":
+			add("X-Forwarded-For", "Client-IP", "True-Client-IP", "X-Real-IP", "CF-Connecting-IP")
+		case "raw-duplicates":
+			add("X-Forwarded-For", "X-Original-URL", "X-Rewrite-URL", "Forwarded")
+		case "raw-authority":
+			add("Host", "Forwarded", "X-HTTP-Host-Override")
+		case "raw-desync":
+			add("Transfer-Encoding", "Content-Length", "Content-Type", "Connection")
+		}
+	}
+	return options.privateHeaders.validatePublic(generated)
 }
 
 // payloadPlaceholderPrefix is used to create unique placeholders that won't collide with URL content.
@@ -4207,7 +4333,7 @@ func executeTechniques(options RequestOptions) {
 }
 
 // requester is the main function that runs all the tests.
-func requester(uri string, proxy string, userAgent string, reqHeaders []string, bypassIP string, folder string, method string, verbose bool, techniques []string, banner bool, rateLimit bool, timeout int, redirect bool, randomAgent bool) {
+func requesterPrivate(uri string, proxy string, userAgent string, reqHeaders []string, bypassIP string, folder string, method string, verbose bool, techniques []string, banner bool, rateLimit bool, timeout int, redirect bool, randomAgent bool, private *privateHeaders) {
 	setVerbose(verbose)
 	setDefaultSc(0)
 	setDefaultRespCl(0)
@@ -4219,7 +4345,16 @@ func requester(uri string, proxy string, userAgent string, reqHeaders []string, 
 		return
 	}
 
-	options := setupRequestOptions(uri, proxy, userAgent, reqHeaders, bypassIP, folder, method, verbose, techniques, banner, rateLimit, timeout, redirect, randomAgent)
+	options := setupRequestOptionsPrivate(uri, proxy, userAgent, reqHeaders, bypassIP, folder, method, verbose, techniques, banner, rateLimit, timeout, redirect, randomAgent, private)
+	if err := private.validatePublic(options.headers); err != nil {
+		log.Printf("[!] %v", err)
+		return
+	}
+	if err := validatePrivateTechniqueCollisions(options); err != nil {
+		log.Printf("[!] %v", err)
+		return
+	}
+	defer clearPrivateReplayReferences()
 
 	// Auto-add payload-position technique if positions were detected
 	if len(options.payloadPositions) > 0 {
@@ -4262,4 +4397,14 @@ func requester(uri string, proxy string, userAgent string, reqHeaders []string, 
 	executeTechniques(options)
 	printSilentTechniqueSummary()
 	printTopFindings(topLimit)
+}
+
+func clearPrivateReplayReferences() {
+	topFindingsMutex.Lock()
+	defer topFindingsMutex.Unlock()
+	for i := range topFindings {
+		if topFindings[i].replay != nil {
+			topFindings[i].replay.private = nil
+		}
+	}
 }

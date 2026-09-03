@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -90,11 +92,11 @@ type header struct {
 // requestWithRetry makes an HTTP request with retry logic and exponential backoff.
 // It retries up to maxRetries times on transient errors (timeouts, connection errors).
 // On HTTP 429, it retries with backoff if rateLimit is false; returns ErrRateLimited if rateLimit is true.
-func requestWithRetry(method, uri string, headers []header, proxy *url.URL, rateLimit bool, timeout int, redirect bool) (ResponseInfo, error) {
-	return requestWithRetryBody(method, uri, headers, "", proxy, rateLimit, timeout, redirect)
+func requestWithRetryPrivate(method, uri string, headers []header, proxy *url.URL, rateLimit bool, timeout int, redirect bool, private *privateHeaders) (ResponseInfo, error) {
+	return requestWithRetryBodyPrivate(method, uri, headers, "", proxy, rateLimit, timeout, redirect, private)
 }
 
-func requestWithRetryBody(method, uri string, headers []header, body string, proxy *url.URL, rateLimit bool, timeout int, redirect bool) (ResponseInfo, error) {
+func requestWithRetryBodyPrivate(method, uri string, headers []header, body string, proxy *url.URL, rateLimit bool, timeout int, redirect bool, private *privateHeaders) (ResponseInfo, error) {
 	maxRetries := retryCount
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -111,7 +113,7 @@ func requestWithRetryBody(method, uri string, headers []header, body string, pro
 			time.Sleep(backoff)
 		}
 
-		resp, err := requestBody(method, uri, headers, body, proxy, timeout, redirect)
+		resp, err := requestBodyPrivate(method, uri, headers, body, proxy, timeout, redirect, private)
 		if err == nil {
 			if resp.statusCode == 429 {
 				if rateLimit {
@@ -137,6 +139,17 @@ func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var privateErr *privateRequestError
+	if errors.As(err, &privateErr) {
+		return privateErr.transient
+	}
+	return errorLooksTransient(err)
+}
+
+func errorLooksTransient(err error) bool {
+	if err == nil {
+		return false
+	}
 	errStr := err.Error()
 	transientPatterns := []string{
 		"timeout",
@@ -154,9 +167,12 @@ func isTransientError(err error) bool {
 	return false
 }
 
-func requestBody(method, uri string, headers []header, body string, proxy *url.URL, timeout int, redirect bool) (ResponseInfo, error) {
+func requestBodyPrivate(method, uri string, headers []header, body string, proxy *url.URL, timeout int, redirect bool, private *privateHeaders) (ResponseInfo, error) {
 	if method == "" {
 		method = "GET"
+	}
+	if err := private.validatePublic(headers); err != nil {
+		return ResponseInfo{}, err
 	}
 
 	if proxy == nil || len(proxy.Host) == 0 {
@@ -166,10 +182,14 @@ func requestBody(method, uri string, headers []header, body string, proxy *url.U
 	// net/http and url.Parse do not accept legacy IIS-style %uXXXX escapes.
 	// Route those requests through the raw client so the request target is sent as-is.
 	if strings.Contains(strings.ToLower(uri), "%u") && proxy == nil && !redirect {
-		return rawRequest(method, uri, rawRequestTarget(uri), headers, body, timeout)
+		return rawRequestPrivate(method, uri, rawRequestTarget(uri), headers, body, timeout, private)
 	}
 
-	client := getClient(proxy, timeout, redirect)
+	baseClient := getClient(proxy, timeout, redirect)
+	client := *baseClient
+	if private != nil {
+		client.Transport = privateOriginTransport{base: baseClient.Transport, private: private}
+	}
 
 	parsedURL, err := url.Parse(uri)
 	if err != nil || parsedURL == nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
@@ -207,16 +227,23 @@ func requestBody(method, uri string, headers []header, body string, proxy *url.U
 
 	res, err := client.Do(req)
 	if err != nil {
+		if private != nil {
+			return ResponseInfo{}, privateRequestFailure(err)
+		}
 		return ResponseInfo{}, err
 	}
 	defer func() {
 		if cerr := res.Body.Close(); cerr != nil {
-			log.Printf("[!] Error closing response body: %v", cerr)
+			if private != nil {
+				log.Printf("[!] Error closing private-header response body")
+			} else {
+				log.Printf("[!] Error closing response body: %v", cerr)
+			}
 		}
 	}()
 
 	bodySize, bodyHash, _ := captureBodySignature(res.Body)
-	return ResponseInfo{
+	info := ResponseInfo{
 		statusCode:    res.StatusCode,
 		contentLength: bodySize,
 		bodyHash:      bodyHash,
@@ -227,11 +254,17 @@ func requestBody(method, uri string, headers []header, body string, proxy *url.U
 		xCache:        res.Header.Get("X-Cache"),
 		poweredBy:     res.Header.Get("X-Powered-By"),
 		cfRay:         res.Header.Get("CF-Ray"),
-	}, nil
+	}
+	private.redactResponseInfo(&info)
+	return info, nil
 }
 
 // loadFlagsFromRequestFile parse an HTTP request and configure the necessary flags for an execution
 func loadFlagsFromRequestFile(requestFile string, schema bool, verbose bool, techniques []string, redirect bool) {
+	loadFlagsFromRequestFilePrivate(requestFile, schema, verbose, techniques, redirect, nil)
+}
+
+func loadFlagsFromRequestFilePrivate(requestFile string, schema bool, verbose bool, techniques []string, redirect bool, privateStore *privateHeaderStore) {
 	// Read the content of the request file
 	content, err := os.ReadFile(requestFile)
 	if err != nil {
@@ -281,7 +314,12 @@ func loadFlagsFromRequestFile(requestFile string, schema bool, verbose bool, tec
 		reqHeaders = append(reqHeaders, k+": "+strings.Join(v, ""))
 	}
 	httpMethod := req.Method
-	requester(uri, proxy, userAgent, reqHeaders, bypassIP, folder, httpMethod, verbose, techniques, nobanner, rateLimit, timeout, redirect, randomAgent)
+	private, err := privateStore.forTarget(uri)
+	if err != nil {
+		log.Printf("[!] %v", err)
+		return
+	}
+	requesterPrivate(uri, proxy, userAgent, reqHeaders, bypassIP, folder, httpMethod, verbose, techniques, nobanner, rateLimit, timeout, redirect, randomAgent, private)
 }
 
 // calibrationTolerance defines the acceptable variance in content-length between calibration samples.
@@ -299,7 +337,7 @@ func runAutocalibrate(options RequestOptions) (int, int) {
 	var lastStatusCode int
 	for _, path := range calibrationPaths {
 		calibrationURI := baseURI + path
-		resp, err := requestWithRetry("GET", calibrationURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+		resp, err := requestWithRetryPrivate("GET", calibrationURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 		if err != nil {
 			log.Printf("[!] Error during calibration request (%s): %v\n", path, err)
 			continue
@@ -350,7 +388,7 @@ func runAutocalibrate(options RequestOptions) (int, int) {
 			parentPath = parentPath[:lastSlash+1]
 		}
 		fragmentURI := parsedURI.Scheme + "://" + parsedURI.Host + parentPath + "#calibration_fragment"
-		fragResp, fragErr := requestWithRetry("GET", fragmentURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect)
+		fragResp, fragErr := requestWithRetryPrivate("GET", fragmentURI, options.headers, options.proxy, options.rateLimit, options.timeout, options.redirect, options.privateHeaders)
 		if fragErr == nil {
 			setFragmentCl(fragResp.contentLength)
 		}
@@ -447,7 +485,10 @@ func captureBodySignature(r io.Reader) (int, string, error) {
 	return total, fmt.Sprintf("%x", hasher.Sum64()), nil
 }
 
-func rawRequest(method, uri string, requestTarget string, headers []header, body string, timeout int) (ResponseInfo, error) {
+func rawRequestPrivate(method, uri string, requestTarget string, headers []header, body string, timeout int, private *privateHeaders) (ResponseInfo, error) {
+	if err := private.validatePublic(headers); err != nil {
+		return ResponseInfo{}, err
+	}
 	parsedURL, err := url.Parse(uri)
 	if err != nil || parsedURL == nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
 		parsedURL, err = parseRawURL(uri)
@@ -478,6 +519,9 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 		conn, err = dialer.Dial("tcp", addr)
 	}
 	if err != nil {
+		if private != nil {
+			return ResponseInfo{}, privateRequestFailure(err)
+		}
 		return ResponseInfo{}, err
 	}
 	defer func() {
@@ -492,7 +536,8 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 	hasHost := false
 	hasConnection := false
 	hasContentLength := false
-	var builder strings.Builder
+	var builder bytes.Buffer
+	defer func() { wipeBytes(builder.Bytes()) }()
 	builder.WriteString(method)
 	builder.WriteString(" ")
 	builder.WriteString(requestTarget)
@@ -512,6 +557,11 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 		builder.WriteString(h.value)
 		builder.WriteString("\r\n")
 	}
+	privateBytes := privateRawHeaderBytes(private, uri)
+	if len(privateBytes) > 0 {
+		builder.Write(privateBytes)
+		wipeBytes(privateBytes)
+	}
 	if !hasHost {
 		builder.WriteString("Host: ")
 		builder.WriteString(parsedURL.Host)
@@ -528,12 +578,18 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 	builder.WriteString("\r\n")
 	builder.WriteString(body)
 
-	if _, err := io.WriteString(conn, builder.String()); err != nil {
+	if _, err := conn.Write(builder.Bytes()); err != nil {
+		if private != nil {
+			return ResponseInfo{}, privateRequestFailure(err)
+		}
 		return ResponseInfo{}, err
 	}
 
 	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
+		if private != nil {
+			return ResponseInfo{}, privateRequestFailure(err)
+		}
 		return ResponseInfo{}, err
 	}
 	defer func() {
@@ -541,7 +597,7 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 	}()
 
 	bodySize, bodyHash, _ := captureBodySignature(res.Body)
-	return ResponseInfo{
+	info := ResponseInfo{
 		statusCode:    res.StatusCode,
 		contentLength: bodySize,
 		bodyHash:      bodyHash,
@@ -552,5 +608,7 @@ func rawRequest(method, uri string, requestTarget string, headers []header, body
 		xCache:        res.Header.Get("X-Cache"),
 		poweredBy:     res.Header.Get("X-Powered-By"),
 		cfRay:         res.Header.Get("CF-Ray"),
-	}, nil
+	}
+	private.redactResponseInfo(&info)
+	return info, nil
 }
