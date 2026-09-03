@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented [here](https://github.com/mr-pmillz/nomore403/blob/main/CHANGELOG.md?ref_type=heads)
 
+## [2.0.3](https://github.com/mr-pmillz/nomore403/compare/v2.0.2...v2.0.3) - 2026-09-03
+
+### ✨ New features
+
+- Feat(options): private header file support - ([cdd1788](https://github.com/mr-pmillz/nomore403/commit/cdd1788d95a35826cfd8a6227e25e8d003a1400d))
+
+### 🛠 Improvements
+
+- Update .gitignore - ([9209eee](https://github.com/mr-pmillz/nomore403/commit/9209eee5cd8a1a465e3f74237ded2808182e0c8a))
+
 ## [2.0.2] - 2026-09-02
 
 ### ✨ New features
@@ -21,6 +31,10 @@ All notable changes to this project will be documented [here](https://github.com
 - Fix: preserve trailing slash in URLs and prevent path normalization - ([c4ddce0](https://github.com/mr-pmillz/nomore403/commit/c4ddce0024764552d8fedbba433dec23143055ec))
 - Fix invalid ref - ([118dcda](https://github.com/mr-pmillz/nomore403/commit/118dcda2a6ec9cc6858e9701c664a909668e4361))
 - Fix ref to httpMethod - ([ed7a28e](https://github.com/mr-pmillz/nomore403/commit/ed7a28edb70bbd7ee0ed51a3da28312fea031bfd))
+
+### ⚙️ Miscellaneous Tasks
+
+- Chore: update changelog - ([90eeaf2](https://github.com/mr-pmillz/nomore403/commit/90eeaf285a76579eb38ea3fb4c947354da17ec04))
 
 ### 📚 Documentation
 
