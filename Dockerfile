@@ -7,11 +7,11 @@ ARG TARGETPLATFORM
 # absolute-uri techniques shell out to it for request forms net/http normalizes
 # away. tini reaps zombies and forwards signals.
 RUN apk add --no-cache ca-certificates curl tini \
-    && addgroup -S -g 10001 nomore403 \
-    && adduser -S -D -H -u 10001 -G nomore403 nomore403
+    && addgroup -S -g 65532 nomore403 \
+    && adduser -S -D -H -u 65532 -G nomore403 nomore403
 
 COPY $TARGETPLATFORM/nomore403 /usr/local/bin/nomore403
 RUN chmod 0755 /usr/local/bin/nomore403
 
-USER 10001:10001
+USER 65532:65532
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/nomore403"]

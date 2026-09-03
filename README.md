@@ -141,6 +141,40 @@ Use a Burp-style request file:
 ./nomore403 --request-file request.txt
 ```
 
+Use private authentication headers without placing credential values in the
+environment or command line:
+
+```bash
+chmod 600 /run/casm-credential/credential.conf
+./nomore403 \
+  --header-file /run/casm-credential/credential.conf \
+  --uri https://target.tld/admin
+```
+
+The owner-only file is newline-delimited and uses `Name: value` syntax:
+
+```text
+Authorization: Bearer example-placeholder
+X-API-Key: example-placeholder
+```
+
+It accepts 1–16 headers in at most 272 KiB; names are RFC tokens and values
+must be non-empty UTF-8 without NUL or line-break bytes.
+
+NoMore403 reads this file once before calibration or scanning. It rejects
+symlinks, non-regular files, files not owned by its effective UID, and files
+with any group or other permission bits on Unix. Private headers are sent only
+to the normalized scheme, host, and effective port of each explicit target.
+They are kept out of banners, results, JSON/JSONL, replay descriptions, and
+printable reproduction commands.
+
+Curl-backed techniques pass private headers through a bounded stdin config;
+private names and values never enter curl argv or environment variables. Since
+curl cannot scope arbitrary custom headers per redirect origin, those
+techniques do not follow redirects while private headers are active. Normal
+HTTP requests continue to follow same-origin redirects and strip private
+headers before cross-origin redirects.
+
 Write machine-readable output:
 
 ```bash
@@ -454,6 +488,10 @@ Key flags:
   - upstream proxy
 - `-H, --header`
   - add custom headers
+- `--header-file`
+  - read private, origin-scoped headers once from an owner-only file
+  - private headers cannot collide case-insensitively with `--header`,
+    `--user-agent`, transport-owned headers, or technique-generated headers
 - `-i, --bypass-ip`
   - IP or hostname used in trust-header techniques
 - `-v, --verbose`
@@ -595,6 +633,8 @@ Edits to `payloads/` in a source checkout take effect on the next build.
 - redirect scoring currently uses heuristics on the immediate redirect response, not a fully followed redirect chain
 - some techniques depend on target-specific behavior and may appear noisy on heavily normalized stacks
 - `curl`-based techniques require `curl` in `PATH`
+- with `--header-file`, curl-backed techniques disable redirect following so
+  private headers cannot cross origins
 
 ## Security and Responsible Use
 
